@@ -1,0 +1,230 @@
+━ Simulator Logs Started on 2025-12-07 19:24:47 ━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #1  —  2025-12-07 19:24:51
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /sim-bucket-one
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/sim-bucket-one', 'x-amz-request-id': '3b718588-07d3-4cd9-bcd0-e0c48a960a09', 'x-localstack': 'true'}
+• Client sees: CreateBucket `sim-bucket-one`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #2  —  2025-12-07 19:24:51
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /sim-bucket-two
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/sim-bucket-two', 'x-amz-request-id': 'eb8b77f0-820b-476b-a215-fba0be7d7d9a', 'x-localstack': 'true'}
+• Client sees: CreateBucket `sim-bucket-two`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #3  —  2025-12-07 19:24:54
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '76885000-0813-46ef-982e-039db431571c', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #4  —  2025-12-07 19:24:54
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '767daeb9-d112-46ab-acff-abe6ed98687b', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #5  —  2025-12-07 19:24:56
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /sim-bucket-two/hello.txt
+• Body: hello simulator
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': 'aaea1794-e31b-464a-9de9-3fb29ecc7a6a', 'x-localstack': 'true'}
+• Client sees: UploadObject `sim-bucket-two/hello.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #6  —  2025-12-07 19:24:56
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /sim-bucket-one/hello.txt
+• Body: hello simulator
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '3b7df096-0626-4e90-8423-193fdd2509b2', 'x-localstack': 'true'}
+• Client sees: UploadObject `sim-bucket-one/hello.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #1  —  2025-12-07 19:25:11
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-1-bucket
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/thread-1-bucket', 'x-amz-request-id': '4eff9f19-74f6-4e9e-96a4-cd85ed9aa2e7', 'x-localstack': 'true'}
+• Client sees: CreateBucket `thread-1-bucket`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #2  —  2025-12-07 19:25:11
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-2-bucket
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/thread-2-bucket', 'x-amz-request-id': '33389f06-5c97-4e3d-bcdc-d03b55a6397b', 'x-localstack': 'true'}
+• Client sees: CreateBucket `thread-2-bucket`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #3  —  2025-12-07 19:25:13
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '1fa399fe-83b2-489a-978a-78a2479d4ae1', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #4  —  2025-12-07 19:25:13
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '19ad849d-e7ca-4bca-be52-b79136b89e42', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #5  —  2025-12-07 19:25:15
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-1-bucket/file1.txt
+• Body: This is file1.txt for upload.
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '8d58eaff-adcc-4586-9d1b-e124431e078d', 'x-localstack': 'true'}
+• Client sees: UploadObject `thread-1-bucket/file1.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #6  —  2025-12-07 19:25:15
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-2-bucket/file2.txt
+• Body: This is file2.txt for upload.
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': 'ad8f6ae7-d5a4-4bd4-a7c0-49a7a402126c', 'x-localstack': 'true'}
+• Client sees: UploadObject `thread-2-bucket/file2.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #1  —  2025-12-07 19:30:44
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-1-bucket/file1.txt
+• Body: This is file1.txt for upload.
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '85b59682-7274-41e8-831d-ab5b9bd249fb', 'x-localstack': 'true'}
+• Client sees: UploadObject `thread-1-bucket/file1.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #1  —  2025-12-07 19:30:56
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-1-bucket
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/thread-1-bucket', 'x-amz-request-id': '0daa4859-57fe-49ff-bcd1-0a8c0f6d58dd', 'x-localstack': 'true'}
+• Client sees: CreateBucket `thread-1-bucket`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #2  —  2025-12-07 19:30:56
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-2-bucket
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'Location': '/thread-2-bucket', 'x-amz-request-id': '59eb7130-9694-4de3-bab1-dd6ee9973e07', 'x-localstack': 'true'}
+• Client sees: CreateBucket `thread-2-bucket`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #3  —  2025-12-07 19:30:58
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': '9209b5e1-a2fa-4a2a-9a01-c8e06b65c3c8', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #4  —  2025-12-07 19:30:58
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: GET
+• Path: /
+• Body: (empty)
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': 'ea56180f-7a9d-4955-a4b2-c6d757b83769', 'x-localstack': 'true'}
+• Client sees: ListBuckets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #6  —  2025-12-07 19:31:00
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-1-bucket/file1.txt
+• Body: This is file1.txt for upload.
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': 'e27a7824-95f4-4bb4-92de-2a73218d0119', 'x-localstack': 'true'}
+• Client sees: UploadObject `thread-1-bucket/file1.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 Request #5  —  2025-12-07 19:31:00
+• Client IP: 127.0.0.1
+• Service: S3
+• Method: PUT
+• Path: /thread-2-bucket/file2.txt
+• Body: This is file2.txt for upload.
+• LocalStack Status: 200
+• Important Headers: {'x-amz-request-id': 'abe3da4c-e0e3-46d3-92a2-e0176ab00acf', 'x-localstack': 'true'}
+• Client sees: UploadObject `thread-2-bucket/file2.txt`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+

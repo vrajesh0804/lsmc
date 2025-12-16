@@ -3,6 +3,7 @@ import boto3
 import os
 import random
 from botocore.config import Config
+import uuid
 
 SIMULATOR_ENDPOINT = "http://localhost:9998"
 
@@ -10,6 +11,11 @@ SIMULATOR_ENDPOINT = "http://localhost:9998"
 FILES = {
     "Thread-1": "file1.txt",
     "Thread-2": "file2.txt",
+}
+
+THREAD_IDENTITIES = {
+    "Thread-1": f"client-{uuid.uuid4().hex[:6]}",
+    "Thread-2": f"client-{uuid.uuid4().hex[:6]}",
 }
 
 # Ensure files exist
@@ -28,12 +34,9 @@ base_s3_client = session.client(
     config=Config(retries={"max_attempts": 3, "mode": "standard"}),
 )
 
-
 def make_thread_client(thread_name: str, logical_port: int):
-    """
-    Create a per-thread S3 client that always sends X-Thread-Port header.
-    """
-    # Clone client via same session/service, then attach event handler
+    client_id = THREAD_IDENTITIES[thread_name]
+
     s3_client = session.client(
         "s3",
         endpoint_url=SIMULATOR_ENDPOINT,
@@ -42,17 +45,16 @@ def make_thread_client(thread_name: str, logical_port: int):
         config=Config(retries={"max_attempts": 3, "mode": "standard"}),
     )
 
-    event_system = s3_client.meta.events
-
-    def add_thread_port_header(model, params, request_signer, **kwargs):
+    def add_headers(model, params, request_signer, **kwargs):
         headers = params.setdefault("headers", {})
         headers["X-Thread-Port"] = str(logical_port)
+        headers["X-Client-Id"] = client_id
 
-    # Add header to all S3 calls
-    event_system.register("before-call.s3", add_thread_port_header)
+    s3_client.meta.events.register("before-call.s3", add_headers)
+
+    print(f"[{thread_name}] 🆔 Using Client ID: {client_id}")
 
     return s3_client
-
 
 def client_flow(thread_name):
     bucket_name = f"{thread_name.lower()}-bucket"
