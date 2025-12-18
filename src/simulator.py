@@ -1,146 +1,110 @@
 from flask import Flask, request, Response
 import threading
-import requests as py_requests
+import requests
+from typing import List
 
-from src.simulator_logger import (
-    log_request,
-    detect_service,
-    detect_dynamodb_command,
-    detect_s3_command
-)
+LOCALSTACK_URL = "http://localhost:9999"
+AWS_METHODS = ["GET", "POST", "PUT", "DELETE"]
 
 app = Flask(__name__)
 
-# -------------------------------
-# GLOBAL STATE
-# -------------------------------
-request_memory_lock = threading.Lock()
-request_memory = []
+lock = threading.Lock()
+condition = threading.Condition(lock)
 
-# Maps unique signature -> inferred thread id
-thread_map = {}
-thread_counter = 0
-
-LOCALSTACK_URL = "http://localhost:9999"
-AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+recorded_flow: List[str] = []
+flow_locked = False
+current_step = 0
 
 
-# ----------------------------------------------------
-def get_clean_body():
-    raw_body = request.get_data(as_text=True)
-    return raw_body if raw_body else "(empty)"
+def step_key(client_id: str, thread_id: str, method: str, path: str) -> str:
+    return f"{client_id}:{thread_id}:{method}:{path}"
 
 
-# ----------------------------------------------------
-def identify_command(service, body, method, path, body_raw):
-    if service == "DynamoDB":
-        return detect_dynamodb_command(request.headers, body)
-
-    if service == "S3":
-        return detect_s3_command(method, path, body_raw)
-
-    return "Unknown"
-
-
-# ----------------------------------------------------
-def build_client_message(service, command, ls_response):
-    if service == "DynamoDB":
-        if "CreateTable" in command:
-            return "DynamoDB table created" if ls_response.status_code == 200 else "Failed to create table"
-        elif "ListTables" in command:
-            return "Tables listed" if ls_response.status_code == 200 else "Failed to list tables"
-        elif "PutItem" in command:
-            return "Item inserted" if ls_response.status_code == 200 else "Failed to insert item"
-        else:
-            return "DynamoDB request processed"
-
-    elif service == "S3":
-        return command
-
-    return "Unknown command"
-
-
-# ----------------------------------------------------
-def forward_to_localstack(method, path):
+def forward_request(method: str, path: str):
     url = f"{LOCALSTACK_URL}/{path}"
+    headers = {k: v for k, v in request.headers if k.lower() != "host"}
 
-    filtered_headers = {
-        k: v for k, v in request.headers if k.lower() != "host"
-    }
-
-    return py_requests.request(
+    return requests.request(
         method=method,
         url=url,
-        headers=filtered_headers,
-        params=request.args,
+        headers=headers,
         data=request.get_data(),
+        params=request.args,
         timeout=10,
     )
 
 
-# ----------------------------------------------------
-def infer_thread_id(client_ip, client_port, client_id):
-    """
-    Simulator guesses thread identity.
-    """
-    global thread_counter
-
-    signature = f"{client_ip}:{client_port}:{client_id or 'NOID'}"
-
-    with request_memory_lock:
-        if signature not in thread_map:
-            thread_counter += 1
-            thread_map[signature] = thread_counter
-
-        return signature, thread_map[signature]
+def print_reference_flow():
+    print("\n🔒 Execution flow locked")
+    print("📋 Reference execution order:\n")
+    for i, step in enumerate(recorded_flow, 1):
+        client, thread, method, path = step.split(":", 3)
+        print(f"  {i}. [{client}] {thread} → {method} {path}")
+    print("\n🧠 Mode: ENFORCE (deterministic replay)\n")
 
 
-# ----------------------------------------------------
-# Thread inference memory
-thread_fingerprints = {}
-thread_counter = 0
-thread_lock = threading.Lock()
+def wait_for_turn(step: str):
+    global current_step
+
+    expected = recorded_flow[current_step]
+
+    if step != expected:
+        print(f"⏸️  PAUSE   {step}")
+        print(f"   ↳ waiting for: {expected}")
+
+    while step != recorded_flow[current_step]:
+        condition.wait()
+
+
+def advance_step():
+    global current_step
+
+    current_step += 1
+
+    if current_step == len(recorded_flow):
+        print("🔁 Execution cycle completed successfully\n")
+        current_step = 0
+
+    condition.notify_all()
+
+
+@app.route("/__execution_done__", methods=["POST"])
+def execution_done():
+    global flow_locked
+    with condition:
+        if not flow_locked:
+            flow_locked = True
+            print_reference_flow()
+        condition.notify_all()
+    return "OK", 200
+
 
 @app.route("/", defaults={"path": ""}, methods=AWS_METHODS)
 @app.route("/<path:path>", methods=AWS_METHODS)
-def proxy(path):
-    global thread_counter
+def proxy(path: str):
+    global flow_locked
 
-    client_ip = request.remote_addr
-    client_port = request.headers.get("X-Thread-Port") or request.environ.get("REMOTE_PORT")
-    client_id = request.headers.get("X-Client-Id", "N/A")
+    client_id = request.headers.get("X-Client-Id", "unknown-client")
+    thread_id = request.headers.get("X-Thread-Id", "unknown-thread")
 
     method = request.method
     path_full = f"/{path}"
 
-    # ---- Thread inference logic ----
-    fingerprint = f"{client_ip}|{client_port}|{client_id}"
+    step = step_key(client_id, thread_id, method, path_full)
 
-    with thread_lock:
-        if fingerprint not in thread_fingerprints:
-            thread_counter += 1
-            thread_fingerprints[fingerprint] = f"T{thread_counter}"
+    with condition:
+        if not flow_locked:
+            recorded_flow.append(step)
+            print(f"🧠 [RECORD] [{client_id}] {thread_id} → {method} {path_full}")
+        else:
+            wait_for_turn(step)
+            print(f"▶️  RESUME  [{client_id}] {thread_id} → {method} {path_full}")
+            advance_step()
 
-        thread_id = thread_fingerprints[fingerprint]
-
-    # ---- Print inference nicely ----
-    print(f"""
-    🧠 Simulator Inference
-       Client IP   : {client_ip}
-       Client Port : {client_port}
-       Client ID   : {client_id}
-       Thread ID   : {thread_id}
-       Request     : {method} {path_full}
-    """)
-
-    # ---- Forward request to LocalStack ----
-    try:
-        ls_response = forward_to_localstack(method, path)
-    except Exception as e:
-        return Response(f"Simulator Error: {str(e)}", status=500)
+    response = forward_request(method, path)
 
     return Response(
-        ls_response.content,
-        status=ls_response.status_code,
-        headers=dict(ls_response.headers),
+        response.content,
+        status=response.status_code,
+        headers=dict(response.headers),
     )
