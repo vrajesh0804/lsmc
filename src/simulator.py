@@ -1,7 +1,12 @@
 from flask import Flask, request, Response
 import threading
-import requests
 from typing import List
+from src.execution_space import (
+    generate_interleavings,
+    split_by_thread,
+    dump_all_executions,
+)
+import requests
 
 LOCALSTACK_URL = "http://localhost:9999"
 AWS_METHODS = ["GET", "POST", "PUT", "DELETE"]
@@ -11,9 +16,22 @@ app = Flask(__name__)
 lock = threading.Lock()
 condition = threading.Condition(lock)
 
-recorded_flow: List[str] = []
+# -----------------------------
+# Global state
+# -----------------------------
+recorded_flow: List[str] = []          # first execution
+all_valid_flows: List[List[str]] = []  # all interleavings
+current_flow: List[str] = []
+executed_steps: List[str] = []
+
 flow_locked = False
 current_step = 0
+run_index = 0
+dumped = False
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 
 def step_key(client_id: str, thread_id: str, method: str, path: str) -> str:
@@ -23,59 +41,70 @@ def step_key(client_id: str, thread_id: str, method: str, path: str) -> str:
 def forward_request(method: str, path: str):
     url = f"{LOCALSTACK_URL}/{path}"
     headers = {k: v for k, v in request.headers if k.lower() != "host"}
-
-    return requests.request(
-        method=method,
-        url=url,
-        headers=headers,
-        data=request.get_data(),
-        params=request.args,
-        timeout=10,
-    )
-
-
-def print_reference_flow():
-    print("\n🔒 Execution flow locked")
-    print("📋 Reference execution order:\n")
-    for i, step in enumerate(recorded_flow, 1):
-        client, thread, method, path = step.split(":", 3)
-        print(f"  {i}. [{client}] {thread} → {method} {path}")
-    print("\n🧠 Mode: ENFORCE (deterministic replay)\n")
+    try:
+        return requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            data=request.get_data(),
+            params=request.args,
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        return Response(str(e), status=500)
 
 
 def wait_for_turn(step: str):
     global current_step
-
-    expected = recorded_flow[current_step]
-
-    if step != expected:
-        print(f"⏸️  PAUSE   {step}")
-        print(f"   ↳ waiting for: {expected}")
-
-    while step != recorded_flow[current_step]:
+    while step != current_flow[current_step]:
         condition.wait()
 
 
-def advance_step():
+def advance_step(step: str):
     global current_step
-
+    executed_steps.append(step)
     current_step += 1
-
-    if current_step == len(recorded_flow):
-        print("🔁 Execution cycle completed successfully\n")
-        current_step = 0
-
     condition.notify_all()
+
+
+# -----------------------------
+# Flask routes
+# -----------------------------
 
 
 @app.route("/__execution_done__", methods=["POST"])
 def execution_done():
-    global flow_locked
+    global flow_locked, all_valid_flows, current_flow
+    global current_step, executed_steps, run_index, dumped
+
     with condition:
+        executed_steps = []
+        current_step = 0
+
+        # First run: compute execution space
         if not flow_locked:
             flow_locked = True
-            print_reference_flow()
+            thread_flows = split_by_thread(recorded_flow)
+            all_valid_flows = list(generate_interleavings(thread_flows))
+
+            if not dumped:
+                dump_all_executions(all_valid_flows)
+                dumped = True
+                print(f"🧠 Total valid executions: {len(all_valid_flows)}")
+                print("📄 Written to all_executions.txt")
+
+            current_flow = all_valid_flows[0]
+
+        else:
+            run_index += 1
+            if run_index >= len(all_valid_flows):
+                print("✅ All valid executions explored.")
+                return "DONE", 200
+
+            current_flow = all_valid_flows[run_index]
+
         condition.notify_all()
+
     return "OK", 200
 
 
@@ -86,7 +115,6 @@ def proxy(path: str):
 
     client_id = request.headers.get("X-Client-Id", "unknown-client")
     thread_id = request.headers.get("X-Thread-Id", "unknown-thread")
-
     method = request.method
     path_full = f"/{path}"
 
@@ -95,14 +123,11 @@ def proxy(path: str):
     with condition:
         if not flow_locked:
             recorded_flow.append(step)
-            print(f"🧠 [RECORD] [{client_id}] {thread_id} → {method} {path_full}")
         else:
             wait_for_turn(step)
-            print(f"▶️  RESUME  [{client_id}] {thread_id} → {method} {path_full}")
-            advance_step()
+            advance_step(step)
 
     response = forward_request(method, path)
-
     return Response(
         response.content,
         status=response.status_code,
