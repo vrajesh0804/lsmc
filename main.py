@@ -1,53 +1,78 @@
-import threading
-import time
 import os
 import sys
+import time
+import threading
 import subprocess
 import requests
+
 from src.simulator import app
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SIM_URL = "http://localhost:9998"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def run_simulator():
-    print("[OK] Simulator started on http://localhost:9998")
+    print("[SIM] Simulator started on http://localhost:9998")
     app.run(host="0.0.0.0", port=9998, threaded=True)
 
 
-def run_client(script):
-    subprocess.run([sys.executable, script], check=True)
-
-
-def wait_for_simulator():
-    while True:
-        r = requests.get(f"{SIM_URL}/__ready__")
-        if r.text == "READY":
-            return True
-        if r.text == "DONE":
-            return False
+def wait_ready(timeout=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            r = requests.get(f"{SIM_URL}/__ready__", timeout=1)
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
         time.sleep(0.2)
+    raise RuntimeError("Simulator not reachable")
+
+
+def reset_localstack():
+    script = os.path.join(PROJECT_ROOT, "reset_localstack.py")
+    if os.path.isfile(script):
+        subprocess.run([sys.executable, script], check=False)
+
+
+def run_client(client_script: str) -> int:
+    cmd = [sys.executable, os.path.join(PROJECT_ROOT, client_script)]
+    p = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    return p.returncode
+
+
+def notify_done(exit_code: int):
+    payload = {"crash": (exit_code != 0), "exit_code": exit_code}
+    requests.post(f"{SIM_URL}/__execution_done__", json=payload, timeout=5)
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python main.py <client_script.py>")
-        sys.exit(1)
+    if len(sys.argv) != 2:
+        print("Usage: python main.py <client_script_path>")
+        sys.exit(2)
 
-    client_script = os.path.join(PROJECT_ROOT, sys.argv[1])
+    client_script = sys.argv[1]
 
-    sim_thread = threading.Thread(target=run_simulator, daemon=True)
-    sim_thread.start()
-    time.sleep(1)
+    t = threading.Thread(target=run_simulator, daemon=True)
+    t.start()
+    wait_ready()
 
-    run_count = 1
+    run_no = 1
     while True:
-        print(f"\n🔁 Executing run #{run_count}")
-        run_client(client_script)
-        if not wait_for_simulator():
-            print("✅ All valid executions completed.")
+        print(f"\n🔁 RUN #{run_no}")
+
+        # Reset state so every run starts from same initial condition
+        reset_localstack()
+
+        exit_code = run_client(client_script)
+        notify_done(exit_code)
+
+        r = requests.get(f"{SIM_URL}/__ready__", timeout=5)
+        if r.text.strip() == "DONE":
+            print("\n✅ All executions explored.")
             break
-        run_count += 1
+
+        run_no += 1
 
 
 if __name__ == "__main__":

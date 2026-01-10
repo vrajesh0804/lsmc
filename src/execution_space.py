@@ -1,6 +1,7 @@
 from typing import List, Dict
 from collections import defaultdict
 
+
 def split_by_thread(flow: List[str]) -> List[List[str]]:
     threads: Dict[str, List[str]] = defaultdict(list)
     for step in flow:
@@ -10,7 +11,7 @@ def split_by_thread(flow: List[str]) -> List[List[str]]:
 
 
 def generate_interleavings(seqs: List[List[str]]):
-    if all(not seq for seq in seqs):
+    if all(not s for s in seqs):
         yield []
         return
 
