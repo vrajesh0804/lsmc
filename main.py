@@ -36,7 +36,13 @@ def run_client(client_script: str) -> int:
 
 def notify_done(exit_code: int):
     payload = {"crash": (exit_code != 0), "exit_code": exit_code}
-    requests.post(f"{SIM_URL}/__execution_done__", json=payload, timeout=5)
+    for attempt in range(3):
+        try:
+            requests.post(f"{SIM_URL}/__execution_done__", json=payload, timeout=30)
+            return
+        except requests.exceptions.ReadTimeout:
+            time.sleep(1.0)
+    raise
 
 
 def main():
