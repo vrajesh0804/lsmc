@@ -1,94 +1,75 @@
-# src/dpor.py
-from typing import List, Dict, Tuple
+from typing import List, Dict, Set, Tuple
 
 def parse_step(step: str) -> Dict[str, str]:
     client, thread, method, path = step.split(":", 3)
     return {"client": client, "thread": thread, "method": method, "path": path}
 
 
-def step_resource_id(info: Dict[str, str]) -> str:
-    """
-    Heuristic resource id:
-      "/"                 -> list buckets
-      "/bucket"           -> bucket
-      "/bucket/key..."    -> "/bucket/key"
-    """
-    path = info["path"]
-    if not path.startswith("/"):
-        path = "/" + path
-    parts = path.split("/")
-    if len(parts) <= 2:
-        return path
-    return "/" + parts[1] + "/" + parts[2]
-
-
-def likely_conflict(a: Dict[str, str], b: Dict[str, str]) -> bool:
-    ra = step_resource_id(a)
-    rb = step_resource_id(b)
-    if ra == rb:
-        return True
-
-    # "/bucket" conflicts with "/bucket/key"
-    if ra.count("/") == 2 and rb.startswith(ra + "/"):
-        return True
-    if rb.count("/") == 2 and ra.startswith(rb + "/"):
-        return True
-
-    # "/" weak conflict with everything
-    if ra == "/" or rb == "/":
-        return True
-
-    return False
-
-
-def prerequisites_for_thread(trace: List[str], upto_index: int, thread_name: str) -> List[int]:
-    idxs = []
-    for k in range(0, upto_index):
-        if parse_step(trace[k])["thread"] == thread_name:
-            idxs.append(k)
-    return idxs
-
-
 def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
     """
-    Minimal enabling prefix using program-order prerequisites only,
-    then force event j before i (swap order).
+    Build a forced prefix that makes trace[j] happen BEFORE trace[i],
+    while preserving per-thread program order prerequisites.
+
+    - minimal prerequisites (same-thread earlier actions)
+    - then force swapped pair (j before i)
+    - suffix is not forced
     """
+    assert 0 <= i < j < len(trace)
+
     ei = parse_step(trace[i])
     ej = parse_step(trace[j])
-    ti, tj = ei["thread"], ej["thread"]
+    ti = ei["thread"]
+    tj = ej["thread"]
 
-    prereq = set(prerequisites_for_thread(trace, i, ti) + prerequisites_for_thread(trace, j, tj))
-    prereq.discard(i)
-    prereq.discard(j)
+    prereq_idx = set()
 
-    prefix = [trace[k] for k in sorted(prereq)]
-    prefix.append(trace[j])
+    # prerequisites for event i (same thread, before i)
+    for k in range(0, i):
+        if parse_step(trace[k])["thread"] == ti:
+            prereq_idx.add(k)
+
+    # prerequisites for event j (same thread, before j)
+    for k in range(0, j):
+        if parse_step(trace[k])["thread"] == tj:
+            prereq_idx.add(k)
+
+    # we will re-order i and j explicitly at the end
+    prereq_idx.discard(i)
+    prereq_idx.discard(j)
+
+    prefix = [trace[k] for k in sorted(prereq_idx)]
+    prefix.append(trace[j])   # swap: j before i
     prefix.append(trace[i])
     return prefix
 
 
-def generate_forced_prefixes(trace: List[str], seen: set, explored: set) -> List[List[str]]:
+def generate_forced_prefixes(
+    trace: List[str],
+    seen_prefixes: Set[Tuple[str, ...]],
+    explored_prefixes: Set[Tuple[str, ...]],
+) -> List[List[str]]:
     """
-    Returns new forced prefixes derived from trace, deduped by (seen/explored).
+    Requirement: if we observe two steps from different threads, consider both orders.
+    Mechanism:
+      - We already observed one order in the trace (i before j)
+      - We generate a forced prefix that swaps them (j before i)
     """
-    parsed = [parse_step(s) for s in trace]
     new_prefixes: List[List[str]] = []
-    n = len(trace)
+    parsed = [parse_step(s) for s in trace]
 
+    n = len(trace)
     for i in range(n):
         for j in range(i + 1, n):
             if parsed[i]["thread"] == parsed[j]["thread"]:
-                continue
-
-            if not likely_conflict(parsed[i], parsed[j]):
-                continue
+                continue  # same-thread order cannot be swapped
 
             prefix = minimal_prefix_for_swap(trace, i, j)
             tp = tuple(prefix)
-            if tp in seen or tp in explored:
+
+            if tp in seen_prefixes or tp in explored_prefixes:
                 continue
-            seen.add(tp)
+
+            seen_prefixes.add(tp)
             new_prefixes.append(prefix)
 
     return new_prefixes

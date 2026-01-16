@@ -1,26 +1,27 @@
 from flask import Flask, request, Response
+import os
 import threading
 import time
 import logging
 from collections import deque
-from typing import List, Tuple
-
+from typing import List, Tuple, Set
 from src.simcore.http_proxy import forward_to_localstack
 from src.simcore.sim_log import write_sim_log
 from src.simcore.scheduler import PrefixScheduler, RUN_SUCCESS, RUN_TIMEOUT
 from src.simcore.dpor import parse_step, generate_forced_prefixes
+import subprocess
+import sys
 
 # ---------------- CONFIG ----------------
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
 LOCALSTACK_URL = "http://localhost:9999"
 AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD"]
-
 FORCED_PREFIX_DEADLOCK_TIMEOUT = 8
-
 RUN_FAILURE = "FAILURE"
 RUN_CRASH = "CRASH"
+TREAT_404_AS_FAIL = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
+print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}")
 
 # ---------------- APP + GLOBAL STATE ----------------
 
@@ -32,7 +33,6 @@ cond = threading.Condition(lock)
 done = False
 run_index = 0
 
-# We store these in small dicts so scheduler can mutate them without circular imports
 current_result = {"value": RUN_SUCCESS}
 failure_reason = {"value": ""}
 
@@ -42,6 +42,9 @@ forced_prefix: List[str] = []  # chosen prefix for current run (for printing/ded
 pending_prefixes = deque()     # queue[prefix]
 seen_prefixes = set()          # set(tuple(prefix))
 explored_prefixes = set()      # set(tuple(prefix))
+
+# Optional: to avoid expanding from identical traces repeatedly
+seen_traces: Set[Tuple[str, ...]] = set()
 
 results: List[Tuple[str, str]] = []  # (result, reason)
 
@@ -58,13 +61,57 @@ def step_key(client: str, thread: str, method: str, path: str) -> str:
     return f"{client}:{thread}:{method}:{path}"
 
 
+def s3_pretty_action(method: str, path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # list buckets
+    if method == "GET" and path == "/":
+        return "list_buckets()"
+
+    # bucket-only path: /bucket-name
+    if path.count("/") == 1:
+        bucket = path[1:]
+        if method == "PUT":
+            return f"create_bucket({bucket})"
+        if method == "HEAD":
+            return f"head_bucket({bucket})"
+        if method == "DELETE":
+            return f"delete_bucket({bucket})"
+        if method == "GET":
+            return f"list_objects(bucket={bucket})"
+
+    # object path: /bucket/key...
+    parts = path.split("/", 2)
+    bucket = parts[1] if len(parts) > 1 else "?"
+    key = parts[2] if len(parts) > 2 else "?"
+
+    if method == "PUT":
+        return f"put_object({bucket}, key={key})"
+    if method == "GET":
+        return f"get_object({bucket}, key={key})"
+    if method == "HEAD":
+        return f"head_object({bucket}, key={key})"
+    if method == "DELETE":
+        return f"delete_object({bucket}, key={key})"
+
+    return f"{method} {path}"
+
+
+def pretty_step(step: str) -> str:
+    info = parse_step(step)
+    action = s3_pretty_action(info["method"], info["path"])
+    return f"{info['client']} | {info['thread']} | {action}"
+
+
 def print_prefix(prefix: List[str]):
     if not prefix:
         print("\n📌 Forced prefix: (empty) — free run / discovery")
         return
+
     print(f"\n📌 Forced prefix (length={len(prefix)})")
     for i, s in enumerate(prefix, start=1):
-        print(f"  {i:02d}. {s}")
+        print(f"  {i:02d}. {pretty_step(s)}")
 
 
 def pick_next_prefix_or_done():
@@ -85,6 +132,24 @@ def watchdog_loop():
                 return
             scheduler.watchdog_tick()
 
+
+def reset_localstack():
+    try:
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "src/reset_localstack.py"
+        )
+        print(script)
+        subprocess.run(
+            [sys.executable, script],
+            timeout=20,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("[SIM] LocalStack reset complete", flush=True)
+    except Exception as e:
+        print(f"[SIM] LocalStack reset failed: {e}", flush=True)
 
 threading.Thread(target=watchdog_loop, daemon=True).start()
 
@@ -124,8 +189,16 @@ def execution_done():
 
         explored_prefixes.add(tuple(forced_prefix))
 
-        # DPOR expansion (trace -> prefixes)
-        new_prefixes = generate_forced_prefixes(trace, seen_prefixes, explored_prefixes)
+        # ----- Duplicate-trace check (skip DPOR expansion) -----
+        trace_key = tuple(trace)
+        if trace_key in seen_traces:
+            print("\n🔁 Duplicate trace observed (already explored). Skipping DPOR expansion.")
+            new_prefixes = []
+        else:
+            seen_traces.add(trace_key)
+            new_prefixes = generate_forced_prefixes(trace, seen_prefixes, explored_prefixes)
+        # ------------------------------------------------------
+
         for p in new_prefixes:
             pending_prefixes.append(p)
 
@@ -134,9 +207,12 @@ def execution_done():
 
         # Reset run state
         trace = []
-        scheduler.start_run([])                 # stop enforcing
+        scheduler.start_run([])  # stop enforcing
         current_result["value"] = RUN_SUCCESS
         failure_reason["value"] = ""
+
+        # Reset localstack after every run
+        reset_localstack()
 
         # Next prefix
         pick_next_prefix_or_done()
@@ -166,25 +242,67 @@ def proxy(path):
     step = step_key(client, thread, method, full_path)
 
     with cond:
-        # Enforce forced prefix while active
+        # ✅ IMPORTANT FIX:
+        # capture the expected step BEFORE wait_for_turn changes forced_pos
+        expected_before = None
+        enforcing_before = scheduler.enforcing and not scheduler.is_prefix_complete()
+        if enforcing_before:
+            expected_before = scheduler.forced_prefix[scheduler.forced_pos]
+
         ok = scheduler.wait_for_turn(step)
         if not ok:
-            write_sim_log(parse_step, step, 408, "Blocked by infeasible forced prefix", run_index + 1, len(trace) + 1)
+            # human-readable block explanation
+            if expected_before:
+                print(
+                    f"[SCHED] BLOCK run={run_index+1} "
+                    f"waiting_for={pretty_step(expected_before)} "
+                    f"but_got={pretty_step(step)}",
+                    flush=True
+                )
+            else:
+                print(
+                    f"[SCHED] BLOCK run={run_index+1} got={pretty_step(step)}",
+                    flush=True
+                )
+
+            write_sim_log(
+                parse_step, step, 408, "Blocked by infeasible forced prefix",
+                run_index + 1, len(trace) + 1
+            )
             return Response("Timeout", status=408)
 
+        # prefix maybe became complete now
         scheduler.maybe_stop_enforcing()
 
-        # Record full trace (including suffix)
         trace.append(step)
         step_index = len(trace)
+
+        # Print scheduler view
+        if enforcing_before and expected_before:
+            print(
+                f"[SCHED] run={run_index+1} ENFORCING expected={pretty_step(expected_before)} got={pretty_step(step)}",
+                flush=True
+            )
+        else:
+            print(f"[SCHED] run={run_index+1} FREE got={pretty_step(step)}", flush=True)
 
     # Forward to LocalStack
     try:
         resp = forward_to_localstack(LOCALSTACK_URL, method, path, timeout=10)
 
-        if resp.status_code >= 400 and current_result["value"] == RUN_SUCCESS:
-            current_result["value"] = RUN_FAILURE
-            failure_reason["value"] = f"{method} {full_path} → {resp.status_code}"
+        # ----- Failure classification with optional 404 ignore -----
+        if current_result["value"] == RUN_SUCCESS:
+            if resp.status_code >= 500:
+                current_result["value"] = RUN_FAILURE
+                failure_reason["value"] = f"{method} {full_path} → {resp.status_code}"
+            elif resp.status_code == 404:
+                if TREAT_404_AS_FAIL:
+                    current_result["value"] = RUN_FAILURE
+                    failure_reason["value"] = f"{method} {full_path} → 404"
+            elif 400 <= resp.status_code < 500:
+                current_result["value"] = RUN_FAILURE
+                failure_reason["value"] = f"{method} {full_path} → {resp.status_code}"
+        # ----------------------------------------------------------
 
         write_sim_log(parse_step, step, resp.status_code, f"HTTP {resp.status_code}", run_index + 1, step_index)
         return Response(resp.content, resp.status_code, resp.headers)
@@ -195,6 +313,7 @@ def proxy(path):
             failure_reason["value"] = "Exception while forwarding request"
         write_sim_log(parse_step, step, 408, "Timeout (exception)", run_index + 1, len(trace))
         return Response("Timeout", status=408)
+
 
 # ---------------- INIT ----------------
 seen_prefixes.add(tuple([]))

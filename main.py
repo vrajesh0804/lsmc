@@ -5,13 +5,13 @@ import threading
 import subprocess
 import requests
 
-from src.simulator import app
-
 SIM_URL = "http://localhost:9998"
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def run_simulator():
+    from src.simulator import app
+
     print("[SIM] Simulator started on http://localhost:9998")
     app.run(host="0.0.0.0", port=9998, threaded=True)
 
@@ -28,13 +28,6 @@ def wait_ready(timeout=15):
         time.sleep(0.2)
     raise RuntimeError("Simulator not reachable")
 
-
-def reset_localstack():
-    script = os.path.join(PROJECT_ROOT, "reset_localstack.py")
-    if os.path.isfile(script):
-        subprocess.run([sys.executable, script], check=False)
-
-
 def run_client(client_script: str) -> int:
     cmd = [sys.executable, os.path.join(PROJECT_ROOT, client_script)]
     p = subprocess.run(cmd, cwd=PROJECT_ROOT)
@@ -47,11 +40,21 @@ def notify_done(exit_code: int):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python main.py <client_script_path>")
+    args = sys.argv[1:]
+
+    treat_404_as_fail = False
+    if "--404-as-fail" in args:
+        treat_404_as_fail = True
+        args.remove("--404-as-fail")
+
+    if len(args) != 1:
+        print("Usage: python main.py [--404-as-fail] <client_script_path>")
         sys.exit(2)
 
-    client_script = sys.argv[1]
+    client_script = args[0]
+
+    # ✅ SET ENV BEFORE importing src.simulator
+    os.environ["SIM_404_AS_FAIL"] = "1" if treat_404_as_fail else "0"
 
     t = threading.Thread(target=run_simulator, daemon=True)
     t.start()
@@ -60,9 +63,6 @@ def main():
     run_no = 1
     while True:
         print(f"\n🔁 RUN #{run_no}")
-
-        # Reset state so every run starts from same initial condition
-        reset_localstack()
 
         exit_code = run_client(client_script)
         notify_done(exit_code)
