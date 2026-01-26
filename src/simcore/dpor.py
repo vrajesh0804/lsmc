@@ -1,44 +1,62 @@
 from typing import List, Dict, Set, Tuple
 
+DROP_PREFIX = "DROP::"
+
+
+def is_drop(ev: str) -> bool:
+    return ev.startswith(DROP_PREFIX)
+
+
+def undrop(ev: str) -> str:
+    return ev[len(DROP_PREFIX):] if is_drop(ev) else ev
+
+
+def drop(ev: str) -> str:
+    return ev if is_drop(ev) else (DROP_PREFIX + ev)
+
+
 def parse_step(step: str) -> Dict[str, str]:
-    client, thread, method, path = step.split(":", 3)
-    return {"client": client, "thread": thread, "method": method, "path": path}
+    """
+    step format:
+      normal:    client:thread:method:path
+      dropped:   DROP::client:thread:method:path
+    """
+    raw = undrop(step)
+    client, thread, method, path = raw.split(":", 3)
+    return {
+        "client": client,
+        "thread": thread,
+        "method": method,
+        "path": path,
+        "is_drop": is_drop(step),
+    }
 
 
 def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
     """
-    Build a forced prefix that makes trace[j] happen BEFORE trace[i],
-    while preserving per-thread program order prerequisites.
-
-    - minimal prerequisites (same-thread earlier actions)
-    - then force swapped pair (j before i)
-    - suffix is not forced
+    DPOR-style swap: make trace[j] occur before trace[i] (minimal prereqs).
+    Works even if some events are DROP::...
     """
     assert 0 <= i < j < len(trace)
 
-    ei = parse_step(trace[i])
-    ej = parse_step(trace[j])
-    ti = ei["thread"]
-    tj = ej["thread"]
+    ti = parse_step(trace[i])["thread"]
+    tj = parse_step(trace[j])["thread"]
 
     prereq_idx = set()
 
-    # prerequisites for event i (same thread, before i)
     for k in range(0, i):
         if parse_step(trace[k])["thread"] == ti:
             prereq_idx.add(k)
 
-    # prerequisites for event j (same thread, before j)
     for k in range(0, j):
         if parse_step(trace[k])["thread"] == tj:
             prereq_idx.add(k)
 
-    # we will re-order i and j explicitly at the end
     prereq_idx.discard(i)
     prereq_idx.discard(j)
 
     prefix = [trace[k] for k in sorted(prereq_idx)]
-    prefix.append(trace[j])   # swap: j before i
+    prefix.append(trace[j])
     prefix.append(trace[i])
     return prefix
 
@@ -49,27 +67,39 @@ def generate_forced_prefixes(
     explored_prefixes: Set[Tuple[str, ...]],
 ) -> List[List[str]]:
     """
-    Requirement: if we observe two steps from different threads, consider both orders.
-    Mechanism:
-      - We already observed one order in the trace (i before j)
-      - We generate a forced prefix that swaps them (j before i)
+    Prof requirement: DROP is an event, so explore interleavings that include DROP events.
+    Also: while exploring, generate more drops (1-drop -> 2-drop -> ...).
+
+    We do that by:
+      (A) swap prefixes across threads
+      (B) full-schedule DROP mutation: replace one *non-drop* event with DROP(event)
     """
     new_prefixes: List[List[str]] = []
     parsed = [parse_step(s) for s in trace]
-
     n = len(trace)
+
+    # (A) swaps across threads
     for i in range(n):
         for j in range(i + 1, n):
             if parsed[i]["thread"] == parsed[j]["thread"]:
-                continue  # same-thread order cannot be swapped
-
+                continue
             prefix = minimal_prefix_for_swap(trace, i, j)
             tp = tuple(prefix)
-
             if tp in seen_prefixes or tp in explored_prefixes:
                 continue
-
             seen_prefixes.add(tp)
             new_prefixes.append(prefix)
+
+    # (B) drop-mutations (full schedule variants)
+    for i in range(n):
+        if is_drop(trace[i]):
+            continue
+        mutated = list(trace)
+        mutated[i] = drop(mutated[i])
+        tp = tuple(mutated)
+        if tp in seen_prefixes or tp in explored_prefixes:
+            continue
+        seen_prefixes.add(tp)
+        new_prefixes.append(mutated)
 
     return new_prefixes
