@@ -8,7 +8,13 @@ from typing import List, Tuple, Set
 
 from src.simcore.http_proxy import forward_to_localstack
 from src.simcore.sim_log import write_sim_log
-from src.simcore.scheduler import PrefixScheduler, RUN_SUCCESS, RUN_TIMEOUT
+from src.simcore.scheduler import (
+    PrefixScheduler,
+    RUN_SUCCESS,
+    RUN_FAILURE,
+    RUN_CRASH,
+    RUN_TIMEOUT,
+)
 from src.simcore.dpor import parse_step, generate_forced_prefixes, DROP_PREFIX, undrop
 from src.simcore.sim_helpers import (
     step_key,
@@ -22,10 +28,8 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 LOCALSTACK_URL = "http://localhost:9999"
 AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD"]
-FORCED_PREFIX_DEADLOCK_TIMEOUT = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "15"))
 
-RUN_FAILURE = "FAILURE"
-RUN_CRASH = "CRASH"
+FORCED_PREFIX_DEADLOCK_TIMEOUT = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "20"))
 
 TREAT_404_AS_FAIL = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
 print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}")
@@ -48,9 +52,7 @@ pending_prefixes = deque()
 seen_prefixes: Set[Tuple[str, ...]] = set()
 explored_prefixes: Set[Tuple[str, ...]] = set()
 
-# traces kept only for stats (NOT used to skip expansion)
 seen_traces: Set[Tuple[str, ...]] = set()
-
 results: List[Tuple[str, str]] = []
 
 scheduler = PrefixScheduler(
@@ -74,7 +76,7 @@ def _print_final_summary(results_list: List[Tuple[str, str]]) -> None:
     print(f"  ⏱ Timeout     : {timeout}", flush=True)
 
 
-def pick_next_prefix_or_done():
+def _pick_next_prefix_or_done() -> None:
     global done, forced_prefix
     if pending_prefixes:
         forced_prefix = pending_prefixes.popleft()
@@ -84,16 +86,16 @@ def pick_next_prefix_or_done():
         done = True
 
 
-def watchdog_loop():
+def _watchdog_loop():
     while True:
-        time.sleep(1)
+        time.sleep(0.25)
         with cond:
             if done:
                 return
             scheduler.watchdog_tick()
 
 
-threading.Thread(target=watchdog_loop, daemon=True).start()
+threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
 @app.route("/__ready__", methods=["GET"])
@@ -116,45 +118,55 @@ def execution_done():
             current_result["value"] = RUN_CRASH
             failure_reason["value"] = f"Client crashed (exit code {exit_code})"
 
-        results.append((current_result["value"], failure_reason["value"]))
+        status = current_result["value"]
+        reason = failure_reason["value"]
+        results.append((status, reason))
 
-        if current_result["value"] == RUN_SUCCESS:
+        if status == RUN_SUCCESS:
             print(f"✅ Execution {run_index}: SUCCESS", flush=True)
-        elif current_result["value"] == RUN_FAILURE:
-            print(f"❌ Execution {run_index}: FAILURE — {failure_reason['value']}", flush=True)
-        elif current_result["value"] == RUN_CRASH:
-            print(f"💥 Execution {run_index}: CRASH — {failure_reason['value']}", flush=True)
+        elif status == RUN_FAILURE:
+            print(f"❌ Execution {run_index}: FAILURE — {reason}", flush=True)
+        elif status == RUN_CRASH:
+            print(f"💥 Execution {run_index}: CRASH — {reason}", flush=True)
         else:
-            # RUN_TIMEOUT
-            print(f"⏱ Execution {run_index}: TIMEOUT — {failure_reason['value']}", flush=True)
+            print(f"⏱ Execution {run_index}: TIMEOUT — {reason}", flush=True)
 
         explored_prefixes.add(tuple(forced_prefix))
 
-        # Always expand unless the run timed out (timeouts are incomplete traces)
+        # ✅ FIX: Only expand DPOR on COMPLETE runs (SUCCESS/FAILURE).
         new_prefixes: List[List[str]] = []
-        if current_result["value"] != RUN_TIMEOUT:
-            seen_traces.add(tuple(trace))
-            new_prefixes = generate_forced_prefixes(trace, seen_prefixes, explored_prefixes)
+        if status in (RUN_SUCCESS, RUN_FAILURE):
+            trace_tuple = tuple(trace)
+            seen_traces.add(trace_tuple)
 
-        # Deterministic order of enqueue
-        new_prefixes_sorted = sorted(new_prefixes, key=lambda p: tuple(p))
+            all_new = generate_forced_prefixes(trace, seen_prefixes, explored_prefixes)
 
-        for p in new_prefixes_sorted:
-            tp = tuple(p)
-            if tp not in explored_prefixes:
-                pending_prefixes.append(p)
+            filtered: List[List[str]] = []
+            for p in all_new:
+                tp = tuple(p)
+                if tp in seen_traces and len(p) == len(trace):
+                    continue
+                filtered.append(p)
 
-        print(f"\n🧠 Discovered {len(new_prefixes_sorted)} new prefixes", flush=True)
+            new_prefixes = sorted(filtered, key=lambda x: tuple(x))
+
+            for p in new_prefixes:
+                tp = tuple(p)
+                if tp not in explored_prefixes:
+                    pending_prefixes.append(p)
+
+        print(f"\n🧠 Discovered {len(new_prefixes)} new prefixes", flush=True)
         print(f"📦 Pending prefixes: {len(pending_prefixes)}", flush=True)
 
-        # Reset for next execution
         trace = []
-        scheduler.start_run([])  # free run until we set next forced prefix
         current_result["value"] = RUN_SUCCESS
         failure_reason["value"] = ""
 
+        scheduler.start_run([])
+
         reset_localstack_quiet()
-        pick_next_prefix_or_done()
+
+        _pick_next_prefix_or_done()
 
         if done:
             _print_final_summary(results)
@@ -178,14 +190,12 @@ def proxy(path):
     base_step = step_key(client, thread, method, full_path)
 
     with cond:
-        expected_now = None
-        if scheduler.enforcing and not scheduler.is_prefix_complete():
-            expected_now = scheduler.forced_prefix[scheduler.forced_pos]
+        # ✅ FIX: determine DROP decision as close as possible to wait_for_turn()
+        expected_now = scheduler.expected_now()
 
         presented = base_step
         drop_now = False
 
-        # If scheduler expects a DROP::<step> and request matches, treat it as DROP step
         if expected_now and expected_now.startswith(DROP_PREFIX) and undrop(expected_now) == base_step:
             presented = expected_now
             drop_now = True
@@ -196,11 +206,11 @@ def proxy(path):
                 parse_step,
                 base_step,
                 408,
-                "Blocked by forced prefix / run ended",
+                "Blocked (run ended / not scheduled)",
                 run_index + 1,
                 len(trace) + 1,
             )
-            return Response("Timeout", status=408)
+            return Response("Blocked", status=408)
 
         scheduler.maybe_stop_enforcing()
 
@@ -209,23 +219,18 @@ def proxy(path):
 
         if expected_now:
             print(
-                f"[SCHED] run={run_index+1} ENFORCING "
-                f"expected={pretty_step(expected_now, parse_step)} "
+                f"[SCHED] run={run_index+1} expected={pretty_step(expected_now, parse_step)} "
                 f"got={pretty_step(presented, parse_step)}",
                 flush=True,
             )
         else:
             print(
-                f"[SCHED] run={run_index+1} FREE got={pretty_step(presented, parse_step)}",
+                f"[SCHED] run={run_index+1} free={pretty_step(presented, parse_step)}",
                 flush=True,
             )
 
-        # DROP: do not forward, do not set run failure, just return 408
         if drop_now:
-            print(
-                f"[DROP] run={run_index+1} dropped={pretty_step(presented, parse_step)}",
-                flush=True,
-            )
+            print(f"[DROP] run={run_index+1} {pretty_step(presented, parse_step)}", flush=True)
             write_sim_log(
                 parse_step,
                 base_step,
@@ -234,9 +239,10 @@ def proxy(path):
                 run_index + 1,
                 step_index,
             )
+            # ✅ helpful: wake up anyone waiting after consuming DROP
+            cond.notify_all()
             return Response("Dropped", status=408)
 
-    # Forward to LocalStack outside lock
     try:
         resp = forward_to_localstack(LOCALSTACK_URL, method, path, timeout=10)
         status = resp.status_code
@@ -260,26 +266,34 @@ def proxy(path):
             run_index + 1,
             step_index,
         )
+
+        label = pretty_step(base_step, parse_step)
+        outcome = "OK" if status < 400 else f"HTTP {status}"
+        print(f"[STEP] run={run_index+1} step={step_index} {label} -> {outcome}", flush=True)
+
         return Response(resp.content, status, resp.headers)
 
-    except Exception:
+    except Exception as e:
         if current_result["value"] == RUN_SUCCESS:
             current_result["value"] = RUN_TIMEOUT
-            failure_reason["value"] = "Exception while forwarding request"
+            failure_reason["value"] = f"LocalStack/forwarding timeout or exception: {type(e).__name__}"
 
         write_sim_log(
             parse_step,
             base_step,
             408,
-            "Timeout (exception)",
+            "Timeout (forwarding exception)",
             run_index + 1,
-            len(trace),
+            step_index,
         )
+
+        label = pretty_step(base_step, parse_step)
+        print(f"[STEP] run={run_index+1} step={step_index} {label} -> TIMEOUT/EXCEPTION", flush=True)
+
         return Response("Timeout", status=408)
 
 
-# Initial seed: explore empty prefix first
 with cond:
     seen_prefixes.add(tuple([]))
     pending_prefixes.append([])
-    pick_next_prefix_or_done()
+    _pick_next_prefix_or_done()

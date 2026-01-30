@@ -10,8 +10,12 @@ def test_scheduler_enforces_order():
     current = {"value": RUN_SUCCESS}
     reason = {"value": ""}
 
-    sched = PrefixScheduler(cond=cond, deadlock_timeout_s=1,
-                           current_result_ref=current, failure_reason_ref=reason)
+    sched = PrefixScheduler(
+        cond=cond,
+        deadlock_timeout_s=1,
+        current_result_ref=current,
+        failure_reason_ref=reason,
+    )
 
     with cond:
         sched.start_run(["A", "B"])
@@ -36,14 +40,19 @@ def test_scheduler_enforces_order():
     assert ("B", True) in results
 
 
-def test_watchdog_timeout():
+def test_watchdog_timeout_sets_timeout_and_reason():
     lock = threading.Lock()
     cond = threading.Condition(lock)
     current = {"value": RUN_SUCCESS}
     reason = {"value": ""}
 
-    sched = PrefixScheduler(cond=cond, deadlock_timeout_s=0.2,
-                           current_result_ref=current, failure_reason_ref=reason)
+    sched = PrefixScheduler(
+        cond=cond,
+        deadlock_timeout_s=0.2,
+        current_result_ref=current,
+        failure_reason_ref=reason,
+    )
+
     with cond:
         sched.start_run(["NEVER"])
 
@@ -52,4 +61,4 @@ def test_watchdog_timeout():
         sched.watchdog_tick()
 
     assert current["value"] == RUN_TIMEOUT
-    assert "Infeasible forced prefix" in reason["value"]
+    assert "Timeout while enforcing forced prefix" in reason["value"]
