@@ -11,7 +11,6 @@ from test.client.expected_client_summaries import EXPECTED_CLIENT_SUMMARIES
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MAIN_PY = PROJECT_ROOT / "main.py"
 
-# Variable declaration
 RE_SUMMARY_HEADER = re.compile(r"(?:📊\s*)?FINAL SUMMARY")
 RE_SUCCESS = re.compile(r"Success\s*:\s*(\d+)")
 RE_FAILURE = re.compile(r"Failure\s*:\s*(\d+)")
@@ -20,28 +19,18 @@ RE_TIMEOUT = re.compile(r"Timeout\s*:\s*(\d+)")
 
 
 def fmt_counts(c: dict) -> str:
-    return (
-        f"Success={c['success']} Failure={c['failure']} "
-        f"Crash={c['crash']} Timeout={c['timeout']}"
-    )
+    return f"Success={c['success']} Failure={c['failure']} Crash={c['crash']} Timeout={c['timeout']}"
 
 
-def parse_final_summary(stdout: str) -> dict | None:
-    """
-    Parse the FINAL SUMMARY from main.py output.
-    """
-    lines = stdout.splitlines()
-
+def parse_final_summary_from_lines(lines: list[str]) -> dict | None:
     last_idx = -1
     for i, line in enumerate(lines):
         if RE_SUMMARY_HEADER.search(line):
             last_idx = i
-
     if last_idx == -1:
         return None
 
-    window = lines[last_idx:last_idx + 20]
-
+    window = lines[last_idx:last_idx + 30]
     counts = {"success": None, "failure": None, "crash": None, "timeout": None}
     for line in window:
         if (m := RE_SUCCESS.search(line)) is not None:
@@ -59,65 +48,67 @@ def parse_final_summary(stdout: str) -> dict | None:
 
 
 def _kill_listeners_on_port(port: int) -> None:
-    """
-    Windows-only: kill any process listening on the given TCP port.
-    Prevents stale simulator instances from previous tests from interfering.
-    """
     if os.name != "nt":
         return
-
-    # Use netstat to get LISTENING PIDs and taskkill them.
-    # We ignore errors to keep tests robust.
     cmd = (
         r'for /f "tokens=5" %a in ('
         rf'\'netstat -ano ^| findstr :{port} ^| findstr LISTENING\''
         r") do taskkill /PID %a /F"
     )
     try:
-        subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
+        subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except Exception:
         pass
 
 
-def run_main(client_script: str, timeout_s: int = 900) -> tuple[int, str, str]:
+def run_main(client_script: str, timeout_s: int = 900) -> tuple[int, list[str]]:
     """
-    Runs exactly like terminal:
-        python main.py <client_script>
-
-    Captures stdout/stderr to parse FINAL SUMMARY.
+    Run main.py but STREAM stdout to avoid pipe backpressure changing scheduling.
+    Returns (returncode, stdout_lines).
     """
-    # Ensure no stale simulator is already holding the port.
     _kill_listeners_on_port(9998)
 
     cmd = [sys.executable, str(MAIN_PY), client_script]
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
-    env["SIM_FREE_GATHER_MS"] = "50"
-    env["SIM_FREE_MIN_THREADS"] = "2"
+    env["PYTHONUNBUFFERED"] = "1"          # ✅ important: flush through pipes
+    env["SIM_FREE_GATHER_MS"] = "200"      # ✅ give time for both threads to arrive
+    env["SIM_FREE_MIN_THREADS"] = "2"      # ✅ works with scheduler patch above
     env.setdefault("PYTHONHASHSEED", "0")
 
     print("\n" + "=" * 80)
     print(f"[pytest] Running: {' '.join(cmd)}")
     print("=" * 80, flush=True)
 
-    p = subprocess.run(
+    p = subprocess.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
         env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        capture_output=True,
         encoding="utf-8",
         errors="replace",
-        timeout=timeout_s,
+        bufsize=1,  # line-buffer
     )
-    return p.returncode, p.stdout, p.stderr
+
+    lines: list[str] = []
+    try:
+        assert p.stdout is not None
+        for line in iter(p.stdout.readline, ""):
+            if line == "" and p.poll() is not None:
+                break
+            lines.append(line.rstrip("\n"))
+            # mirror to pytest console (so -s still feels like terminal)
+            print(line, end="")
+        rc = p.wait(timeout=timeout_s)
+        return rc, lines
+    finally:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 def pytest_sessionstart(session):
@@ -131,8 +122,8 @@ def pytest_sessionstart(session):
 def test_client_runs_via_main_py_and_matches_expected_summary(client_script: str):
     expected = EXPECTED_CLIENT_SUMMARIES[client_script]
 
-    rc, out, err = run_main(client_script, timeout_s=900)
-    got = parse_final_summary(out)
+    rc, out_lines = run_main(client_script, timeout_s=900)
+    got = parse_final_summary_from_lines(out_lines)
 
     if got is not None:
         print("\n[pytest] FINAL SUMMARY (parsed from main.py output)")
@@ -142,26 +133,18 @@ def test_client_runs_via_main_py_and_matches_expected_summary(client_script: str
         print(f"  Timeout : {got['timeout']}")
         print("", flush=True)
     else:
-        print("\n[pytest] FINAL SUMMARY not found.", flush=True)
-        # Helpful debug if parsing fails
-        tail = "\n".join(out.splitlines()[-60:])
-        print("[pytest] --- stdout tail (last 60 lines) ---")
-        print(tail, flush=True)
-        print("[pytest] --- stderr ---")
-        print(err, flush=True)
+        tail = "\n".join(out_lines[-80:])
+        raise AssertionError(
+            f"[pytest] FAILED for {client_script}\n"
+            f"Reason   : FINAL SUMMARY not found in output\n"
+            f"Expected : {fmt_counts(expected)}\n"
+            f"--- stdout tail (last 80 lines) ---\n{tail}"
+        )
 
     if rc != 0:
         raise AssertionError(
             f"[pytest] FAILED for {client_script}\n"
-            f"Reason   : main.py exited with non-zero code ({rc})\n"
-            f"stderr   : {err.strip()[:400]}"
-        )
-
-    if got is None:
-        raise AssertionError(
-            f"[pytest] FAILED for {client_script}\n"
-            f"Reason   : FINAL SUMMARY not found in output\n"
-            f"Expected : {fmt_counts(expected)}"
+            f"Reason   : main.py exited with non-zero code ({rc})"
         )
 
     if got != expected:
