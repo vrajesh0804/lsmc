@@ -30,7 +30,6 @@ LOCALSTACK_URL = "http://localhost:9999"
 AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD"]
 
 FORCED_PREFIX_DEADLOCK_TIMEOUT = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "20"))
-
 TREAT_404_AS_FAIL = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
 print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}")
 
@@ -133,7 +132,6 @@ def execution_done():
 
         explored_prefixes.add(tuple(forced_prefix))
 
-        # ✅ FIX: Only expand DPOR on COMPLETE runs (SUCCESS/FAILURE).
         new_prefixes: List[List[str]] = []
         if status in (RUN_SUCCESS, RUN_FAILURE):
             trace_tuple = tuple(trace)
@@ -148,7 +146,8 @@ def execution_done():
                     continue
                 filtered.append(p)
 
-            new_prefixes = sorted(filtered, key=lambda x: tuple(x))
+            # stable ordering
+            new_prefixes = sorted(filtered, key=lambda x: (len(x), tuple(x)))
 
             for p in new_prefixes:
                 tp = tuple(p)
@@ -163,9 +162,7 @@ def execution_done():
         failure_reason["value"] = ""
 
         scheduler.start_run([])
-
         reset_localstack_quiet()
-
         _pick_next_prefix_or_done()
 
         if done:
@@ -190,17 +187,7 @@ def proxy(path):
     base_step = step_key(client, thread, method, full_path)
 
     with cond:
-        # ✅ FIX: determine DROP decision as close as possible to wait_for_turn()
-        expected_now = scheduler.expected_now()
-
-        presented = base_step
-        drop_now = False
-
-        if expected_now and expected_now.startswith(DROP_PREFIX) and undrop(expected_now) == base_step:
-            presented = expected_now
-            drop_now = True
-
-        ok = scheduler.wait_for_turn(presented)
+        ok = scheduler.wait_for_turn(base_step)
         if not ok:
             write_sim_log(
                 parse_step,
@@ -212,24 +199,29 @@ def proxy(path):
             )
             return Response("Blocked", status=408)
 
+        # What did we ACTUALLY match?
+        matched, was_drop = scheduler.consume_last_match()
+        # matched is either base_step or DROP::base_step (when expected was DROP)
+        presented = matched if matched is not None else base_step
+
         scheduler.maybe_stop_enforcing()
 
         trace.append(presented)
         step_index = len(trace)
 
-        if expected_now:
-            print(
-                f"[SCHED] run={run_index+1} expected={pretty_step(expected_now, parse_step)} "
-                f"got={pretty_step(presented, parse_step)}",
-                flush=True,
-            )
-        else:
-            print(
-                f"[SCHED] run={run_index+1} free={pretty_step(presented, parse_step)}",
-                flush=True,
-            )
+        # Logging: now it's correct and deterministic
+        exp_info = "free"
+        if scheduler.expected_now() is not None:
+            # NOTE: expected_now() is now "next expected", not the one we just matched.
+            # We log using "got=" only (and keep your free/expected style minimal).
+            exp_info = "expected"
 
-        if drop_now:
+        if exp_info == "free":
+            print(f"[SCHED] run={run_index+1} free={pretty_step(presented, parse_step)}", flush=True)
+        else:
+            print(f"[SCHED] run={run_index+1} got={pretty_step(presented, parse_step)}", flush=True)
+
+        if was_drop:
             print(f"[DROP] run={run_index+1} {pretty_step(presented, parse_step)}", flush=True)
             write_sim_log(
                 parse_step,
@@ -239,7 +231,6 @@ def proxy(path):
                 run_index + 1,
                 step_index,
             )
-            # ✅ helpful: wake up anyone waiting after consuming DROP
             cond.notify_all()
             return Response("Dropped", status=408)
 

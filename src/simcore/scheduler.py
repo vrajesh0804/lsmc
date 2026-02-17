@@ -1,9 +1,9 @@
 # src/simcore/scheduler.py
+import os
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 from src.simcore.dpor import DROP_PREFIX, undrop
-
 
 RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
@@ -13,14 +13,13 @@ RUN_TIMEOUT = "TIMEOUT"
 
 class PrefixScheduler:
     """
-    Enforces a 'forced prefix' over incoming steps.
+    Enforces a forced prefix over incoming steps.
 
-    Key behaviors:
-    - If enforcing and expected step never arrives for deadlock_timeout_s,
-      watchdog_tick() marks RUN_CRASH (forced-prefix deadlock).
-    - TIMEOUT is reserved for forwarding/LocalStack timeouts/exceptions.
-    - DROP steps are policy decisions: the client presents the base step X,
-      and if the forced prefix expects DROP::X, we must treat X as satisfying it.
+    Deterministic FREE runs:
+      - buffer contenders for a small gather window EACH step
+      - pick lexicographically smallest presented_step among buffered contenders
+      - (optional) for the very first free decision, wait until we have seen
+        at least N unique threads, or until the gather window expires
     """
 
     def __init__(
@@ -35,108 +34,176 @@ class PrefixScheduler:
         self.current_result_ref = current_result_ref
         self.failure_reason_ref = failure_reason_ref
 
-        # Current run state
         self.forced_prefix: List[str] = []
         self.enforcing: bool = False
         self.forced_pos: int = 0
 
-        self._run_started_at: float = time.time()
-        self._last_progress_at: float = time.time()
+        now = time.time()
+        self._last_progress_at: float = now
 
-        # Last matched step info (consumed by simulator under the same lock)
-        self._last_matched_step: Optional[str] = None  # the forced-prefix token matched (may include DROP::)
+        # last match info (set by wait_for_turn, read by simulator)
+        self._last_matched_step: Optional[str] = None
         self._last_was_drop: bool = False
 
+        # FREE-run determinism knobs
+        self._free_gather_ms = int(os.environ.get("SIM_FREE_GATHER_MS", "50"))
+        # Wait for at least this many unique threads before choosing the FIRST free step
+        self._free_min_unique_threads = int(os.environ.get("SIM_FREE_MIN_THREADS", "2"))
+
+        # FREE-run state
+        self._free_waiting: List[str] = []
+        self._free_released_count: int = 0
+
+        # NEW: per-step gather deadline (not only first step)
+        self._free_deadline: Optional[float] = None
+        self._free_seen_threads: Set[str] = set()
+
     def start_run(self, forced_prefix: List[str]) -> None:
-        """
-        Begin a new run. If forced_prefix is empty => free run (no enforcement).
-        """
         self.forced_prefix = list(forced_prefix)
         self.enforcing = len(self.forced_prefix) > 0
         self.forced_pos = 0
 
         now = time.time()
-        self._run_started_at = now
         self._last_progress_at = now
 
         self._last_matched_step = None
         self._last_was_drop = False
 
-        self.cond.notify_all()
+        # reset FREE-run state
+        self._free_waiting = []
+        self._free_released_count = 0
+        self._free_deadline = None
+        self._free_seen_threads = set()
 
-    def is_prefix_complete(self) -> bool:
-        return (not self.enforcing) or (self.forced_pos >= len(self.forced_prefix))
+        self.cond.notify_all()
 
     def expected_now(self) -> Optional[str]:
         if self.enforcing and self.forced_pos < len(self.forced_prefix):
             return self.forced_prefix[self.forced_pos]
         return None
 
+    def is_prefix_complete(self) -> bool:
+        return (not self.enforcing) or (self.forced_pos >= len(self.forced_prefix))
+
+    def maybe_stop_enforcing(self) -> None:
+        if self.enforcing and self.forced_pos >= len(self.forced_prefix):
+            self.enforcing = False
+            self.cond.notify_all()
+
     def consume_last_match(self) -> Tuple[Optional[str], bool]:
-        """
-        Returns (matched_step, was_drop) for the *most recent* successful wait_for_turn(),
-        then clears it. Must be called under the same Condition lock.
-        """
         ms = self._last_matched_step
         wd = self._last_was_drop
         self._last_matched_step = None
         self._last_was_drop = False
         return ms, wd
 
+    @staticmethod
+    def _extract_thread(presented_step: str) -> str:
+        """
+        presented_step format: client:thread:method:path (or DROP::client:thread:...)
+        We'll parse only enough to get thread.
+        """
+        raw = undrop(presented_step)
+        parts = raw.split(":", 3)
+        if len(parts) >= 2:
+            return parts[1]
+        return "unknown"
+
+    def _free_set_deadline_if_needed(self) -> None:
+        if self._free_deadline is None:
+            if self._free_gather_ms <= 0:
+                self._free_deadline = time.time()
+            else:
+                self._free_deadline = time.time() + (self._free_gather_ms / 1000.0)
+
+    def _free_reset_for_next_choice(self) -> None:
+        """
+        After we choose one step, we start a new gather window for the next choice.
+        """
+        self._free_deadline = None
+        # Keep _free_seen_threads across the whole run (helps first-step rule only)
+
     def wait_for_turn(self, presented_step: str) -> bool:
         """
-        Block until:
-          - run ended (CRASH/FAILURE/TIMEOUT) -> return False
-          - free run OR this satisfies the expected step -> advance and return True
-
-        DROP rule:
-          If expected == "DROP::<X>" and presented_step == "<X>",
-          treat it as a match, advance forced_pos, and mark last_was_drop=True.
-
-        The simulator calls this under the same Condition lock.
+        Blocks until:
+          - run ended => False
+          - FREE run => deterministic selection (gather each step, choose min)
+          - enforcing => matches expected step (incl. DROP expectation)
         """
         while True:
             if self.current_result_ref["value"] != RUN_SUCCESS:
                 return False
 
+            # ---------- FREE RUN ----------
             if not self.enforcing:
-                self._last_matched_step = presented_step
-                self._last_was_drop = False
-                self._mark_progress()
-                return True
+                # record contender
+                if presented_step not in self._free_waiting:
+                    self._free_waiting.append(presented_step)
 
+                # record seen thread (for first-step stability)
+                tname = self._extract_thread(presented_step)
+                self._free_seen_threads.add(tname)
+
+                # start gather window for this free decision
+                self._free_set_deadline_if_needed()
+
+                # FIRST FREE CHOICE: optionally wait for >= N unique threads (or deadline)
+                if self._free_released_count == 0 and self._free_min_unique_threads > 1:
+                    # If we haven't seen enough threads yet, wait until deadline
+                    if len(self._free_seen_threads) < self._free_min_unique_threads:
+                        now = time.time()
+                        if now < (self._free_deadline or now):
+                            self.cond.wait(timeout=max(0.0, (self._free_deadline or now) - now))
+                            continue
+
+                # For ALL free choices: wait until gather deadline expires
+                now = time.time()
+                if self._free_deadline is not None and now < self._free_deadline:
+                    self.cond.wait(timeout=max(0.0, self._free_deadline - now))
+                    continue
+
+                if not self._free_waiting:
+                    self.cond.wait(timeout=0.1)
+                    continue
+
+                chosen = min(self._free_waiting)
+                if presented_step == chosen:
+                    self._free_waiting.remove(chosen)
+                    self._free_released_count += 1
+
+                    self._last_matched_step = presented_step
+                    self._last_was_drop = False
+                    self._last_progress_at = time.time()
+
+                    # prepare next free decision
+                    self._free_reset_for_next_choice()
+                    return True
+
+                self.cond.wait(timeout=0.1)
+                continue
+
+            # ---------- ENFORCING ----------
             exp = self.expected_now()
 
-            # Exact match (including "DROP::..." if simulator presented that)
+            # exact match
             if exp == presented_step:
                 self.forced_pos += 1
                 self._last_matched_step = exp
                 self._last_was_drop = bool(exp and exp.startswith(DROP_PREFIX))
-                self._mark_progress()
+                self._last_progress_at = time.time()
                 return True
 
-            # ✅ Critical: expected is DROP::<X> but we received base step <X>
+            # expected is DROP::<X>, but presented is <X>
             if exp and exp.startswith(DROP_PREFIX) and undrop(exp) == presented_step:
                 self.forced_pos += 1
-                self._last_matched_step = exp          # record as DROP::<X>
+                self._last_matched_step = exp
                 self._last_was_drop = True
-                self._mark_progress()
+                self._last_progress_at = time.time()
                 return True
 
             self.cond.wait(timeout=0.1)
 
-    def maybe_stop_enforcing(self) -> None:
-        """
-        If we finished the forced prefix, stop enforcing for remainder of run.
-        """
-        if self.enforcing and self.forced_pos >= len(self.forced_prefix):
-            self.enforcing = False
-            self.cond.notify_all()
-
     def watchdog_tick(self) -> None:
-        """
-        If enforcing and stuck waiting too long for next forced step, mark CRASH.
-        """
         if self.current_result_ref["value"] != RUN_SUCCESS:
             return
         if not self.enforcing:
@@ -153,6 +220,3 @@ class PrefixScheduler:
                 f"Forced-prefix deadlock: waited > {self.deadlock_timeout_s}s for step #{step_no}"
             )
             self.cond.notify_all()
-
-    def _mark_progress(self) -> None:
-        self._last_progress_at = time.time()
