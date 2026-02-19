@@ -54,7 +54,7 @@ class PrefixScheduler:
         self._free_waiting: List[str] = []
         self._free_released_count: int = 0
 
-        # NEW: per-step gather deadline (not only first step)
+        # per-step gather deadline (not only first step)
         self._free_deadline: Optional[float] = None
         self._free_seen_threads: Set[str] = set()
 
@@ -149,7 +149,6 @@ class PrefixScheduler:
 
                 # FIRST FREE CHOICE: optionally wait for >= N unique threads (or deadline)
                 if self._free_released_count == 0 and self._free_min_unique_threads > 1:
-                    # If we haven't seen enough threads yet, wait until deadline
                     if len(self._free_seen_threads) < self._free_min_unique_threads:
                         now = time.time()
                         if now < (self._free_deadline or now):
@@ -217,6 +216,6 @@ class PrefixScheduler:
             step_no = self.forced_pos + 1
             self.current_result_ref["value"] = RUN_CRASH
             self.failure_reason_ref["value"] = (
-                f"Forced-prefix deadlock: waited > {self.deadlock_timeout_s}s for step #{step_no}"
+                f"Timeout while enforcing forced prefix: waited > {self.deadlock_timeout_s}s for step #{step_no}"
             )
             self.cond.notify_all()

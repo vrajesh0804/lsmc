@@ -2,13 +2,13 @@
 
 EXPECTED_CLIENT_SUMMARIES = {
 	"client/S3/if_else_bucket_checked_create_vs_delete_shared_boto.py": {
-        "success": 12,
+        "success": 13,
         "failure": 0,
         "crash": 2,
         "timeout": 0,
     },
     "client/S3/bucket_checked_create_vs_delete_shared_boto.py": {
-        "success": 12,
+        "success": 13,
         "failure": 0,
         "crash": 2,
         "timeout": 0,
@@ -26,9 +26,9 @@ EXPECTED_CLIENT_SUMMARIES = {
         "timeout": 0,
     },
     "client/mixed/a_s3_bucket_exists_then_ddb_create_table.py":{
-        "success": 4,
-        "failure": 1,
-        "crash": 0,
+        "success": 13,
+        "failure": 0,
+        "crash": 2,
         "timeout": 0,
     }
 }

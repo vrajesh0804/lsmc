@@ -36,6 +36,10 @@ def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
     """
     DPOR-style swap: make trace[j] occur before trace[i] (minimal prereqs).
     Works even if some events are DROP::...
+
+    NOTE: We keep this helper (and tests) because it's useful for reasoning,
+    but the simulator uses *full-schedule* swap variants to avoid repeated runs
+    caused by partially-forced prefixes.
     """
     assert 0 <= i < j < len(trace)
 
@@ -61,34 +65,52 @@ def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
     return prefix
 
 
+def full_schedule_for_swap(trace: List[str], i: int, j: int) -> List[str]:
+    """
+    Return a *full schedule* variant that forces trace[j] to occur before trace[i],
+    while preserving the relative order of all other events as in `trace`.
+
+    This helps ensure each forced prefix corresponds to exactly one deterministic run,
+    preventing repeated executions that can happen with partially-forced prefixes.
+    """
+    assert 0 <= i < j < len(trace)
+    t = list(trace)
+    ev_j = t.pop(j)
+    # insert j right before i (i still points to the original position)
+    t.insert(i, ev_j)
+    return t
+
+
 def generate_forced_prefixes(
     trace: List[str],
     seen_prefixes: Set[Tuple[str, ...]],
     explored_prefixes: Set[Tuple[str, ...]],
 ) -> List[List[str]]:
     """
-    Prof requirement: DROP is an event, so explore interleavings that include DROP events.
-    Also: while exploring, generate more drops (1-drop -> 2-drop -> ...).
+    Explore all deterministic interleavings, plus systematic DROP variants, without repeats.
 
-    We do that by:
-      (A) swap prefixes across threads
-      (B) full-schedule DROP mutation: replace one *non-drop* event with DROP(event)
+    We generate:
+      (A) full-schedule swap variants across different threads
+      (B) full-schedule DROP mutation variants (turn one non-drop event into DROP::event)
+
+    Because the simulator completes FREE choices deterministically, using full schedules
+    (instead of partial/minimal prefixes) greatly reduces duplicate runs.
     """
     new_prefixes: List[List[str]] = []
     parsed = [parse_step(s) for s in trace]
     n = len(trace)
 
-    # (A) swaps across threads
+    # (A) full-schedule swaps across threads
     for i in range(n):
         for j in range(i + 1, n):
             if parsed[i]["thread"] == parsed[j]["thread"]:
                 continue
-            prefix = minimal_prefix_for_swap(trace, i, j)
-            tp = tuple(prefix)
+            swapped = full_schedule_for_swap(trace, i, j)
+            tp = tuple(swapped)
             if tp in seen_prefixes or tp in explored_prefixes:
                 continue
             seen_prefixes.add(tp)
-            new_prefixes.append(prefix)
+            new_prefixes.append(swapped)
 
     # (B) drop-mutations (full schedule variants)
     for i in range(n):
