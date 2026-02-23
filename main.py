@@ -61,14 +61,20 @@ def main() -> int:
         treat_404_as_fail = True
         args.remove("--404-as-fail")
 
+    enable_drop = False
+    if "--drop" in args:
+        enable_drop = True
+        args.remove("--drop")
+
     if len(args) != 1:
-        print("Usage: python main.py [--404-as-fail] <client_script_path>")
+        print("Usage: python main.py [--404-as-fail] [--drop] <client_script_path>")
         return 2
 
     client_script = args[0]
 
     # Must be set BEFORE src.simulator is imported (it reads env at import time)
     os.environ["SIM_404_AS_FAIL"] = "1" if treat_404_as_fail else "0"
+    os.environ["SIM_ENABLE_DROP"] = "1" if enable_drop else "0"
 
     # Start simulator in-process (daemon thread)
     t = threading.Thread(target=run_simulator, daemon=True)

@@ -32,6 +32,8 @@ AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD"]
 FORCED_PREFIX_DEADLOCK_TIMEOUT = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "20"))
 TREAT_404_AS_FAIL = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
 print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}")
+ENABLE_DROP = os.environ.get("SIM_ENABLE_DROP", "0") == "1"
+print(f"[SIM] DROP enabled: {ENABLE_DROP}", flush=True)
 
 app = Flask(__name__)
 
@@ -198,7 +200,12 @@ def execution_done():
             for k in range(1, len(trace_tuple) + 1):
                 explored_trace_prefixes.add(trace_tuple[:k])
 
-            all_new = generate_forced_prefixes(trace, seen_prefixes, explored_prefixes)
+            all_new = generate_forced_prefixes(
+                trace,
+                seen_prefixes,
+                explored_prefixes,
+                enable_drop=ENABLE_DROP,
+            )
 
             # Filter:
             filtered: List[List[str]] = []

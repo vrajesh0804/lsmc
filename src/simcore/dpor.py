@@ -71,6 +71,8 @@ def generate_forced_prefixes(
     trace: List[str],
     seen_prefixes: Set[Tuple[str, ...]],
     explored_prefixes: Set[Tuple[str, ...]],
+    *,
+    enable_drop: bool = False,
 ) -> List[List[str]]:
     """
     Generate only *feasible-by-construction* forced prefixes for your simulator.
@@ -112,17 +114,18 @@ def generate_forced_prefixes(
         new_prefixes.append(swapped_prefix)
 
     # (B) DROP mutation prefixes only up to the dropped event
-    for i in range(n):
-        if is_drop(trace[i]):
-            continue
+    if enable_drop:
+        for i in range(n):
+            if is_drop(trace[i]):
+                continue
 
-        drop_prefix = list(trace[: i + 1])
-        drop_prefix[i] = drop(drop_prefix[i])
+            drop_prefix = list(trace[: i + 1])
+            drop_prefix[i] = drop(drop_prefix[i])
 
-        tp = tuple(drop_prefix)
-        if tp in seen_prefixes or tp in explored_prefixes:
-            continue
-        seen_prefixes.add(tp)
-        new_prefixes.append(drop_prefix)
+            tp = tuple(drop_prefix)
+            if tp in seen_prefixes or tp in explored_prefixes:
+                continue
+            seen_prefixes.add(tp)
+            new_prefixes.append(drop_prefix)
 
     return new_prefixes

@@ -61,14 +61,19 @@ def _kill_listeners_on_port(port: int) -> None:
         pass
 
 
-def run_main(client_script: str, timeout_s: int = 900) -> tuple[int, list[str]]:
+def run_main(client_args: str, timeout_s: int = 900) -> tuple[int, list[str]]:
     """
     Run main.py but STREAM stdout to avoid pipe backpressure changing scheduling.
     Returns (returncode, stdout_lines).
     """
     _kill_listeners_on_port(9998)
 
-    cmd = [sys.executable, str(MAIN_PY), client_script]
+    if isinstance(client_args, str):
+        # allow "--drop <path>" form
+        parts = client_args.split()
+        cmd = [sys.executable, str(MAIN_PY)] + parts
+    else:
+        cmd = [sys.executable, str(MAIN_PY)] + list(client_args)
 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
