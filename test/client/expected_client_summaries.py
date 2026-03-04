@@ -1,6 +1,30 @@
 # test/client/expected_client_summaries.py
 
 EXPECTED_CLIENT_SUMMARIES = {
+    "client/S3/create_bucket_one_thread.py": {
+        "success": 1,
+        "failure": 0,
+        "crash": 0,
+        "timeout": 0,
+    },
+    "--drop client/S3/create_bucket_one_thread.py": {
+        "success": 2,
+        "failure": 0,
+        "crash": 0,
+        "timeout": 0,
+    },
+    "--delay client/S3/create_bucket_one_thread.py": {
+        "success": 2,
+        "failure": 0,
+        "crash": 0,
+        "timeout": 0,
+    },
+    "--drop --delay client/S3/create_bucket_one_thread.py": {
+        "success": 3,
+        "failure": 0,
+        "crash": 0,
+        "timeout": 0,
+    },
 	"client/S3/if_else_bucket_checked_create_vs_delete_shared_boto.py": {
         "success": 2,
         "failure": 0,

@@ -6,8 +6,8 @@ from src.simcore.dpor import DROP_PREFIX, undrop, DELAY_PREFIX, undelay, delay_s
 
 RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
-RUN_CRASH = "CRASH"
-RUN_TIMEOUT = "TIMEOUT"
+RUN_CRASH = "CRASH"     # kept for compatibility, but scheduler will not set it anymore
+RUN_TIMEOUT = "TIMEOUT" # ✅ watchdog/enforcement timeout uses this now
 
 
 class PrefixScheduler:
@@ -19,6 +19,16 @@ class PrefixScheduler:
       - pick lexicographically smallest presented_step among buffered contenders
       - (optional) for the very first free decision, wait until we have seen
         at least N unique threads, or until the gather window expires
+
+    ✅ New thesis semantics / functionality:
+      - Watchdog timeout while enforcing forced prefix => RUN_TIMEOUT (not RUN_CRASH)
+      - When --drop and --delay are used together:
+          * We allow forced tokens of the form DROP::<step> OR DELAY::<s>::<step>
+          * We DO NOT allow nested tokens like DROP::DELAY::... (or DELAY::DROP::...)
+            because you asked: "make sure the drop one can't be delay in same execution"
+            (i.e., a single base step cannot be both dropped and delayed in the same run)
+        If DPOR accidentally generates nested wrappers, the scheduler will treat it as invalid
+        and never match it (so the run will TIMEOUT under watchdog).
     """
 
     def __init__(
@@ -29,7 +39,7 @@ class PrefixScheduler:
         current_result_ref: dict,
         failure_reason_ref: dict,
     ):
-        # IMPORTANT: keep `cond` keyword arg API (your simulator calls PrefixScheduler(cond=cond,...))
+        # IMPORTANT: keep `cond` keyword arg API
         self.cond = cond
         self.deadlock_timeout_s = deadlock_timeout_s
         self.current_result_ref = current_result_ref
@@ -46,7 +56,7 @@ class PrefixScheduler:
         self._last_matched_step: Optional[str] = None
         self._last_was_drop: bool = False
 
-        # NEW: delay info
+        # delay info
         self._last_was_delay: bool = False
         self._last_delay_s: int = 0
 
@@ -102,9 +112,9 @@ class PrefixScheduler:
             * enforcing: the expected token (so includes DROP/DELAY wrapper)
             * free mode: the presented step
         - was_drop:
-            True if the expected token was DROP::... (or DROP::DELAY::...)
+            True if the expected token was DROP::...
         - was_delay:
-            True if the expected token was DELAY::... (or DROP::DELAY::...)
+            True if the expected token was DELAY::... (NOT nested)
         - delay_seconds:
             parsed seconds (0 if not delayed or malformed)
         """
@@ -118,6 +128,20 @@ class PrefixScheduler:
         self._last_was_delay = False
         self._last_delay_s = 0
         return ms, wd, wdel, ds
+
+    @staticmethod
+    def _is_nested_wrapper(exp: str) -> bool:
+        """
+        Returns True if exp is something like DROP::DELAY::... or DELAY::DROP::...
+        We treat these as invalid per your requirement (no step can be both dropped and delayed).
+        """
+        if exp.startswith(DROP_PREFIX):
+            inner = undrop(exp)
+            return inner.startswith(DELAY_PREFIX) or inner.startswith(DROP_PREFIX)
+        if exp.startswith(DELAY_PREFIX):
+            inner = undelay(exp)
+            return inner.startswith(DROP_PREFIX) or inner.startswith(DELAY_PREFIX)
+        return False
 
     @staticmethod
     def _extract_thread(step: str) -> str:
@@ -193,6 +217,17 @@ class PrefixScheduler:
 
             # ---------- ENFORCING ----------
             exp = self.expected_now()
+            if exp is None:
+                # should not happen, but be safe
+                self.enforcing = False
+                self.cond.notify_all()
+                return True
+
+            # ✅ Disallow nested wrapper tokens by design
+            if self._is_nested_wrapper(exp):
+                # never match; let watchdog mark TIMEOUT for incorrect prefix generation
+                self.cond.wait(timeout=0.1)
+                continue
 
             # exact match (rare; usually presented is unwrapped)
             if exp == presented_step:
@@ -201,40 +236,30 @@ class PrefixScheduler:
                 self._last_progress_at = time.time()
                 return True
 
-            # expected DROP::X but presented X
-            if exp and exp.startswith(DROP_PREFIX) and undrop(exp) == presented_step:
+            # expected DROP::<X> but presented X
+            if exp.startswith(DROP_PREFIX) and undrop(exp) == presented_step:
                 self.forced_pos += 1
                 self._set_last_match_from_expected(exp)
                 self._last_progress_at = time.time()
                 return True
 
-            # expected DELAY::<s>::X but presented X
-            if exp and exp.startswith(DELAY_PREFIX) and undelay(exp) == presented_step:
+            # expected DELAY::<s>::<X> but presented X
+            if exp.startswith(DELAY_PREFIX) and undelay(exp) == presented_step:
                 self.forced_pos += 1
                 self._set_last_match_from_expected(exp)
                 self._last_progress_at = time.time()
                 return True
-
-            # expected DROP::DELAY::<s>::X but presented X
-            if exp and exp.startswith(DROP_PREFIX):
-                inner = undrop(exp)
-                if inner.startswith(DELAY_PREFIX) and undelay(inner) == presented_step:
-                    self.forced_pos += 1
-                    self._set_last_match_from_expected(exp)
-                    self._last_progress_at = time.time()
-                    return True
 
             self.cond.wait(timeout=0.1)
 
     def _set_last_match_from_expected(self, exp: Optional[str]) -> None:
         """
         exp is the forced expected token (may be wrapped).
+        Nested wrappers are disallowed; this function assumes non-nested exp.
         """
         self._last_matched_step = exp
-
         self._last_was_drop = bool(exp and exp.startswith(DROP_PREFIX))
 
-        # delay may be outer (DELAY::...) or inner (DROP::DELAY::...)
         self._last_was_delay = False
         self._last_delay_s = 0
 
@@ -246,11 +271,10 @@ class PrefixScheduler:
             self._last_delay_s = int(delay_seconds(exp) or 0)
             return
 
+        # DROP::<...> only (no delay inside allowed)
         if exp.startswith(DROP_PREFIX):
-            inner = undrop(exp)
-            if inner.startswith(DELAY_PREFIX):
-                self._last_was_delay = True
-                self._last_delay_s = int(delay_seconds(inner) or 0)
+            self._last_was_delay = False
+            self._last_delay_s = 0
 
     def watchdog_tick(self) -> None:
         # Preserve your semantics: watchdog only matters while enforcing
@@ -265,7 +289,8 @@ class PrefixScheduler:
         stuck_for = now - self._last_progress_at
         if stuck_for > self.deadlock_timeout_s:
             step_no = self.forced_pos + 1
-            self.current_result_ref["value"] = RUN_CRASH
+            # ✅ thesis semantics: watchdog is a TIMEOUT (not CRASH)
+            self.current_result_ref["value"] = RUN_TIMEOUT
             self.failure_reason_ref["value"] = (
                 f"Timeout while enforcing forced prefix: waited > {self.deadlock_timeout_s}s for step #{step_no}"
             )

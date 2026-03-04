@@ -57,7 +57,6 @@ def _classify_client_error_from_lines(lines: List[str]) -> Tuple[bool, Optional[
             detail = ln.strip()
             break
 
-    # If client sees HTTP 408 from simulator, treat as TIMEOUT (it waited / got blocked / delay run advanced)
     timeout_markers = [
         "HTTP 408",
         "ClientError 408",
@@ -133,7 +132,9 @@ def main() -> int:
     treat_404_as_fail = False
     enable_drop = False
     enable_delay = False
-    delay_seconds = 60
+
+    # ✅ New default when --delay is enabled
+    delay_seconds = 20
 
     if "--404-as-fail" in args:
         treat_404_as_fail = True
@@ -147,21 +148,59 @@ def main() -> int:
         enable_delay = True
         args.remove("--delay")
 
-    # Optional: allow --delay-seconds N (keeps your CLI future-proof)
+    # ✅ NEW: --delay-for-<N>
+    # - only applies if --delay was provided
+    # - otherwise it's ignored (removed from args)
+    delay_for_val: Optional[int] = None
+    delay_for_tokens = [a for a in args if a.startswith("--delay-for-")]
+    if delay_for_tokens:
+        # allow only one occurrence
+        if len(delay_for_tokens) > 1:
+            print("ERROR: use only one --delay-for-<N>", flush=True)
+            return 2
+
+        tok = delay_for_tokens[0]
+        args.remove(tok)
+
+        s = tok[len("--delay-for-") :]
+        if not s.isdigit():
+            print("ERROR: --delay-for-<N> requires integer N, e.g. --delay-for-100", flush=True)
+            return 2
+        delay_for_val = int(s)
+
+    # Optional (kept): --delay-seconds N
+    # If used, it behaves like --delay-for-<N> but requires --delay too.
     if "--delay-seconds" in args:
         i = args.index("--delay-seconds")
         if i + 1 >= len(args):
             print("Usage: python main.py [--delay-seconds N] ...", flush=True)
             return 2
         try:
-            delay_seconds = int(args[i + 1])
+            val = int(args[i + 1])
         except ValueError:
             print("ERROR: --delay-seconds must be an integer", flush=True)
             return 2
         del args[i:i + 2]
 
+        if delay_for_val is not None:
+            print("ERROR: use either --delay-for-<N> OR --delay-seconds N (not both)", flush=True)
+            return 2
+        delay_for_val = val
+
+    # Apply delay override only if --delay was actually enabled
+    if enable_delay:
+        if delay_for_val is not None:
+            delay_seconds = delay_for_val
+    else:
+        # --delay is not present => ignore any delay-for/delay-seconds
+        # (we already removed delay-for token; delay-seconds would have been parsed above)
+        pass
+
     if len(args) != 1:
-        print("Usage: python main.py [--404-as-fail] [--drop] [--delay] [--delay-seconds N] <client_script_path>")
+        print(
+            "Usage: python main.py [--404-as-fail] [--drop] [--delay] "
+            "[--delay-for-<N>] [--delay-seconds N] <client_script_path>"
+        )
         return 2
 
     client_script = args[0]

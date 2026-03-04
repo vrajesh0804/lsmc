@@ -1,3 +1,4 @@
+# src/simulator.py
 from flask import Flask, request, Response
 import os
 import threading
@@ -41,6 +42,22 @@ ENABLE_DELAY = os.environ.get("SIM_ENABLE_DELAY", "0") == "1"
 DELAY_SECONDS = int(os.environ.get("SIM_DELAY_SECONDS", "60"))
 print(f"[SIM] DELAY enabled: {ENABLE_DELAY} (seconds={DELAY_SECONDS})", flush=True)
 
+# Phase ordering:
+#   - "drop_first": pure -> drop-only -> delay-only -> mixed
+#   - "delay_first": pure -> delay-only -> drop-only -> mixed
+PHASE_ORDER = os.environ.get("SIM_PHASE_ORDER", "drop_first").strip().lower()
+if PHASE_ORDER not in ("drop_first", "delay_first"):
+    PHASE_ORDER = "drop_first"
+print(f"[SIM] PHASE order: {PHASE_ORDER}", flush=True)
+
+# ✅ New thesis semantics:
+# - 408 must mean "real timeout" only (LocalStack/forwarding exception or watchdog timeout).
+# - DROP / blocked / simulator artifacts must NOT use 408.
+# - You asked: "else count as success" -> we return a *successful* response for DROP/blocked
+#   using a cross-run cache of real LocalStack responses when available.
+ARTIFACT_OK_STATUS = int(os.environ.get("SIM_ARTIFACT_OK_STATUS", "200"))
+print(f"[SIM] Artifact treated as OK: HTTP {ARTIFACT_OK_STATUS}", flush=True)
+
 app = Flask(__name__)
 
 lock = threading.Lock()
@@ -73,6 +90,11 @@ step_attempts_this_run: Dict[str, int] = defaultdict(int)
 # Per-run: response cache so client retries get SUCCESS (no simulator-created 408)
 # base_step -> (status_code, body_bytes, headers_dict)
 response_cache_this_run: Dict[str, Tuple[int, bytes, Dict[str, str]]] = {}
+
+# ✅ Cross-run cache (NEW): lets DROP/blocked return a real success payload
+# so botocore parses it as success and your run counts as SUCCESS.
+# base_step -> (status_code, body_bytes, headers_dict)
+stable_response_cache: Dict[str, Tuple[int, bytes, Dict[str, str]]] = {}
 
 # Per-run: track which base steps are currently being executed/forwarded
 inflight_steps_this_run: Set[str] = set()
@@ -130,6 +152,71 @@ def _watchdog_loop():
 threading.Thread(target=_watchdog_loop, daemon=True).start()
 
 
+def _prefix_phase_rank(pfx: List[str]) -> int:
+    """
+    Return a phase rank for ordering exploration.
+
+    We categorize by whether the prefix contains DROP and/or DELAY tokens.
+    - pure: no DROP and no DELAY
+    - drop-only: DROP but no DELAY
+    - delay-only: DELAY but no DROP
+    - mixed: both DROP and DELAY
+
+    Order depends on SIM_PHASE_ORDER:
+      drop_first:  pure(0) -> drop(1) -> delay(2) -> mixed(3)
+      delay_first: pure(0) -> delay(1) -> drop(2) -> mixed(3)
+    """
+    has_drop = any(s.startswith("DROP::") for s in pfx)
+
+    # DELAY can appear as DELAY::... or DROP::DELAY::...
+    def _is_delay_token(s: str) -> bool:
+        if s.startswith("DELAY::"):
+            return True
+        if s.startswith("DROP::"):
+            inner = s[len("DROP::") :]
+            return inner.startswith("DELAY::")
+        return False
+
+    has_delay = any(_is_delay_token(s) for s in pfx)
+
+    if not has_drop and not has_delay:
+        return 0
+
+    if PHASE_ORDER == "delay_first":
+        if has_delay and not has_drop:
+            return 1
+        if has_drop and not has_delay:
+            return 2
+    else:
+        # drop_first
+        if has_drop and not has_delay:
+            return 1
+        if has_delay and not has_drop:
+            return 2
+
+    # mixed
+    return 3
+
+
+def _prefix_sort_key(pfx: List[str]) -> tuple:
+    # Phase first, then shorter prefixes, then lexicographic stability
+    return (_prefix_phase_rank(pfx), len(pfx), tuple(pfx))
+
+
+def _artifact_ok_response_for(base_step: str) -> Response:
+    """
+    ✅ New: for DROP/blocked/artifacts, return a success response.
+    Prefer a real LocalStack payload from stable cache, so botocore doesn't choke.
+    """
+    if base_step in stable_response_cache:
+        status, body, hdrs = stable_response_cache[base_step]
+        # status should already be 2xx/3xx from a real run; keep it.
+        return Response(body, status=status, headers=hdrs)
+
+    # fallback: "OK" (may or may not satisfy botocore for all ops, but avoids 408)
+    return Response(b"", status=ARTIFACT_OK_STATUS)
+
+
 @app.route("/__ready__", methods=["GET"])
 def ready():
     return ("DONE", 200) if done else ("READY", 200)
@@ -140,8 +227,10 @@ def execution_done():
     """
     End-of-run handler.
 
-    NOTE: We expand DPOR also from TIMEOUT traces (not from CRASH) so that exploration
-    still reaches full DELAY-variant space even if forwarding/localstack times out.
+    ✅ New thesis semantics:
+      - Treat CRASH as TIMEOUT (so crash bucket becomes 0 in summaries).
+      - TIMEOUT should represent real timeout (LocalStack/forwarding exception or watchdog timeout).
+      - DROP/blocked should not cause TIMEOUT anymore (they are served as OK responses).
     """
     global run_index, trace, done, forced_prefix
     global seen_base_steps_this_run, step_attempts_this_run
@@ -158,13 +247,12 @@ def execution_done():
     with cond:
         run_index += 1
 
-        # Highest priority: crash
+        # ✅ CRASH -> TIMEOUT (instead of CRASH)
         if is_crash and current_result["value"] == RUN_SUCCESS:
-            current_result["value"] = RUN_CRASH
-            failure_reason["value"] = f"Client crashed (exit code {exit_code})"
+            current_result["value"] = RUN_TIMEOUT
+            failure_reason["value"] = f"Client crash treated as timeout (exit code {exit_code})"
 
-        # Next: client-reported error overrides SUCCESS
-        # (Now that retries are served from cache, simulator-induced 408 won't trigger this.)
+        # Client-reported errors can still override SUCCESS, but now DROP/blocked shouldn't trigger them.
         if (not is_crash) and client_had_error and current_result["value"] == RUN_SUCCESS:
             if client_error_kind == "TIMEOUT":
                 current_result["value"] = RUN_TIMEOUT
@@ -202,6 +290,7 @@ def execution_done():
         elif status == RUN_FAILURE:
             print(f"❌ Execution {run_index}: FAILURE — {reason}", flush=True)
         elif status == RUN_CRASH:
+            # should no longer happen (scheduler now sets RUN_TIMEOUT)
             print(f"💥 Execution {run_index}: CRASH — {reason}", flush=True)
         else:
             print(f"⏱ Execution {run_index}: TIMEOUT — {reason}", flush=True)
@@ -232,7 +321,8 @@ def execution_done():
                     continue
                 filtered.append(p)
 
-            new_prefixes = sorted(filtered, key=lambda x: (len(x), tuple(x)))
+            # IMPORTANT: phase ordering + stable tie-breakers
+            new_prefixes = sorted(filtered, key=_prefix_sort_key)
             for p in new_prefixes:
                 pending_prefixes.append(p)
 
@@ -279,7 +369,7 @@ def proxy(path):
         step_attempts_this_run[base_step] += 1
         attempt_no = step_attempts_this_run[base_step]
 
-        # If this is a retry/duplicate, return cached SUCCESS instead of simulator 408.
+        # If this is a retry/duplicate, return cached SUCCESS.
         if base_step in seen_base_steps_this_run:
             # If the first attempt is still executing, wait until it's cached
             while base_step in inflight_steps_this_run and base_step not in response_cache_this_run:
@@ -292,7 +382,6 @@ def proxy(path):
                     f"{pretty_step(base_step, parse_step)}",
                     flush=True,
                 )
-                # Optional: log retry served (not a failure)
                 write_sim_log(
                     parse_step,
                     base_step,
@@ -303,26 +392,25 @@ def proxy(path):
                 )
                 return Response(body, status=status, headers=hdrs)
 
-            # Extremely rare fallback: no cache (do not fail the run)
+            # fallback: use stable cache or OK
             print(
-                f"[RETRY] run={run_index+1} attempt={attempt_no} duplicate but no cache yet -> returning 200 empty",
+                f"[RETRY] run={run_index+1} attempt={attempt_no} duplicate but no cache yet -> returning artifact OK",
                 flush=True,
             )
-            return Response(b"", status=200)
+            return _artifact_ok_response_for(base_step)
 
         ok = scheduler.wait_for_turn(base_step)
         if not ok:
-            # This can happen if run already ended; return 408 (client may treat as timeout)
-            # If you want to NEVER fail client here, we can also make this 200. For now keep as-is.
+            # ✅ New: blocked should not be 408; return OK (and keep run SUCCESS).
             write_sim_log(
                 parse_step,
                 base_step,
-                408,
-                "Blocked (run ended / not scheduled)",
+                ARTIFACT_OK_STATUS,
+                "Blocked (run ended / not scheduled) treated as OK",
                 run_index + 1,
                 len(trace) + 1,
             )
-            return Response("Blocked", status=408)
+            return _artifact_ok_response_for(base_step)
 
         matched, was_drop, was_delay, matched_delay_s = scheduler.consume_last_match()
         presented = matched if matched is not None else base_step
@@ -341,20 +429,20 @@ def proxy(path):
         else:
             print(f"[SCHED] run={run_index+1} got={pretty_step(presented, parse_step)}", flush=True)
 
-        # DROP
+        # ✅ DROP: return OK (prefer stable cached payload), NOT 408
         if was_drop:
             print(f"[DROP] run={run_index+1} {pretty_step(presented, parse_step)}", flush=True)
             write_sim_log(
                 parse_step,
                 base_step,
-                408,
-                "Dropped by simulator",
+                ARTIFACT_OK_STATUS,
+                "Dropped by simulator treated as OK",
                 run_index + 1,
                 step_index,
             )
             inflight_steps_this_run.discard(base_step)
             cond.notify_all()
-            return Response("Dropped", status=408)
+            return _artifact_ok_response_for(base_step)
 
         # DELAY (STRICT SYNC): hold cond for entire delay + forwarding => other threads wait
         if was_delay and matched_delay_s > 0:
@@ -402,16 +490,19 @@ def proxy(path):
                     flush=True,
                 )
 
-                # Cache successful (or non-408) response for retries
+                # Cache response for retries (per-run)
                 hdrs = {k: v for k, v in resp.headers.items()}
                 response_cache_this_run[base_step] = (status, resp.content, hdrs)
+
+                # ✅ Also cache across runs (NEW) for DROP/blocked OK responses
+                stable_response_cache.setdefault(base_step, (status, resp.content, hdrs))
+
                 inflight_steps_this_run.discard(base_step)
                 cond.notify_all()
-
                 return Response(resp.content, status, resp.headers)
 
             except Exception as e:
-                # Only LocalStack/forwarding exceptions set TIMEOUT
+                # ✅ 408 only for real LocalStack/forwarding exceptions
                 if current_result["value"] == RUN_SUCCESS:
                     current_result["value"] = RUN_TIMEOUT
                     failure_reason["value"] = f"LocalStack/forwarding exception: {type(e).__name__}"
@@ -467,16 +558,19 @@ def proxy(path):
                 flush=True,
             )
 
-            # Cache response for retries
+            # Cache response for retries (per-run)
             hdrs = {k: v for k, v in resp.headers.items()}
             response_cache_this_run[base_step] = (status, resp.content, hdrs)
+
+            # ✅ Also cache across runs (NEW) for DROP/blocked OK responses
+            stable_response_cache.setdefault(base_step, (status, resp.content, hdrs))
+
             inflight_steps_this_run.discard(base_step)
             cond.notify_all()
-
             return Response(resp.content, status, resp.headers)
 
         except Exception:
-            # Only LocalStack/forwarding exceptions set TIMEOUT
+            # ✅ 408 only for real LocalStack/forwarding exceptions
             if current_result["value"] == RUN_SUCCESS:
                 current_result["value"] = RUN_TIMEOUT
                 failure_reason["value"] = "LocalStack/forwarding exception"
