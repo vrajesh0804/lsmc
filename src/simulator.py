@@ -3,8 +3,8 @@ import os
 import threading
 import time
 import logging
-from collections import deque
-from typing import List, Tuple, Set
+from collections import deque, defaultdict
+from typing import List, Tuple, Set, Dict
 
 from src.simcore.http_proxy import forward_to_localstack
 from src.simcore.sim_log import write_sim_log
@@ -30,10 +30,16 @@ LOCALSTACK_URL = "http://localhost:9999"
 AWS_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD"]
 
 FORCED_PREFIX_DEADLOCK_TIMEOUT = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "20"))
+
 TREAT_404_AS_FAIL = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
-print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}")
+print(f"[SIM] 404 treated as failure: {TREAT_404_AS_FAIL}", flush=True)
+
 ENABLE_DROP = os.environ.get("SIM_ENABLE_DROP", "0") == "1"
 print(f"[SIM] DROP enabled: {ENABLE_DROP}", flush=True)
+
+ENABLE_DELAY = os.environ.get("SIM_ENABLE_DELAY", "0") == "1"
+DELAY_SECONDS = int(os.environ.get("SIM_DELAY_SECONDS", "60"))
+print(f"[SIM] DELAY enabled: {ENABLE_DELAY} (seconds={DELAY_SECONDS})", flush=True)
 
 app = Flask(__name__)
 
@@ -53,13 +59,23 @@ pending_prefixes = deque()
 seen_prefixes: Set[Tuple[str, ...]] = set()
 explored_prefixes: Set[Tuple[str, ...]] = set()
 
-# traces we have actually executed (unique)
 seen_traces: Set[Tuple[str, ...]] = set()
-
-# all prefixes of those traces, used to prevent scheduling duplicates BEFORE running them
 explored_trace_prefixes: Set[Tuple[str, ...]] = set()
 
 results: List[Tuple[str, str]] = []
+
+# Per-run: first-time executed base steps
+seen_base_steps_this_run: Set[str] = set()
+
+# Per-run: how many times each base_step arrived (attempts=1 => no retry)
+step_attempts_this_run: Dict[str, int] = defaultdict(int)
+
+# Per-run: response cache so client retries get SUCCESS (no simulator-created 408)
+# base_step -> (status_code, body_bytes, headers_dict)
+response_cache_this_run: Dict[str, Tuple[int, bytes, Dict[str, str]]] = {}
+
+# Per-run: track which base steps are currently being executed/forwarded
+inflight_steps_this_run: Set[str] = set()
 
 scheduler = PrefixScheduler(
     cond=cond,
@@ -83,31 +99,19 @@ def _print_final_summary(results_list: List[Tuple[str, str]]) -> None:
 
 
 def _pick_next_prefix_or_done() -> None:
-    """
-    Pick the next forced prefix to execute.
-    Hard requirement: do NOT run duplicates.
-    That means: if forcing a prefix would deterministically replay an already-seen trace,
-    we skip it BEFORE starting the run.
-    """
     global done, forced_prefix
 
     while pending_prefixes:
         candidate = pending_prefixes.popleft()
         tp = tuple(candidate)
 
-        # If we already tried this exact forced prefix, skip.
         if tp in explored_prefixes:
             continue
-
-        # If this forced prefix is already a prefix of an explored trace,
-        # the run is guaranteed (under deterministic completion) to be a duplicate.
         if tp in explored_trace_prefixes:
             continue
 
         forced_prefix = candidate
         scheduler.start_run(forced_prefix)
-
-        # Print only what is actually forced (truthful)
         print_prefix(forced_prefix, parse_step)
         return
 
@@ -135,40 +139,55 @@ def ready():
 def execution_done():
     """
     End-of-run handler.
-    - Never count duplicates
-    - Never expand DPOR from duplicates
-    - Always reset + pick next
+
+    NOTE: We expand DPOR also from TIMEOUT traces (not from CRASH) so that exploration
+    still reaches full DELAY-variant space even if forwarding/localstack times out.
     """
     global run_index, trace, done, forced_prefix
+    global seen_base_steps_this_run, step_attempts_this_run
+    global response_cache_this_run, inflight_steps_this_run
 
     payload = request.get_json(silent=True) or {}
     is_crash = bool(payload.get("crash"))
     exit_code = payload.get("exit_code")
 
+    client_had_error = bool(payload.get("client_had_error", False))
+    client_error_kind = payload.get("client_error_kind")  # "TIMEOUT"/"FAILURE"/None
+    client_error_detail = (payload.get("client_error_detail") or "").strip()
+
     with cond:
         run_index += 1
 
-        # If client crashed but simulator thought success so far, mark crash.
+        # Highest priority: crash
         if is_crash and current_result["value"] == RUN_SUCCESS:
             current_result["value"] = RUN_CRASH
             failure_reason["value"] = f"Client crashed (exit code {exit_code})"
 
+        # Next: client-reported error overrides SUCCESS
+        # (Now that retries are served from cache, simulator-induced 408 won't trigger this.)
+        if (not is_crash) and client_had_error and current_result["value"] == RUN_SUCCESS:
+            if client_error_kind == "TIMEOUT":
+                current_result["value"] = RUN_TIMEOUT
+                failure_reason["value"] = client_error_detail or "Client timed out"
+            else:
+                current_result["value"] = RUN_FAILURE
+                failure_reason["value"] = client_error_detail or "Client reported failure"
+
         status = current_result["value"]
         reason = failure_reason["value"]
 
-        # Mark forced prefix as explored regardless.
         explored_prefixes.add(tuple(forced_prefix))
-
         trace_tuple = tuple(trace)
 
-        # ----------------------------
-        # HARD TRACE DEDUPE (silent)
-        # ----------------------------
-        if status in (RUN_SUCCESS, RUN_FAILURE) and trace_tuple in seen_traces:
-            # Do not print anything, do not count anything, do not expand anything.
+        # HARD TRACE DEDUPE (silent) includes TIMEOUT too
+        if status in (RUN_SUCCESS, RUN_FAILURE, RUN_TIMEOUT) and trace_tuple in seen_traces:
             trace = []
             current_result["value"] = RUN_SUCCESS
             failure_reason["value"] = ""
+            seen_base_steps_this_run = set()
+            step_attempts_this_run = defaultdict(int)
+            response_cache_this_run = {}
+            inflight_steps_this_run = set()
 
             scheduler.start_run([])
             reset_localstack_quiet()
@@ -176,9 +195,6 @@ def execution_done():
             cond.notify_all()
             return ("OK", 200)
 
-        # ----------------------------
-        # Count unique runs
-        # ----------------------------
         results.append((status, reason))
 
         if status == RUN_SUCCESS:
@@ -192,11 +208,9 @@ def execution_done():
 
         new_prefixes: List[List[str]] = []
 
-        # Only expand DPOR from SUCCESS / FAILURE unique traces.
-        if status in (RUN_SUCCESS, RUN_FAILURE):
+        # Expand DPOR from SUCCESS/FAILURE/TIMEOUT (NOT crash)
+        if status in (RUN_SUCCESS, RUN_FAILURE, RUN_TIMEOUT):
             seen_traces.add(trace_tuple)
-
-            # Add all prefixes of this trace so we never run deterministic duplicates
             for k in range(1, len(trace_tuple) + 1):
                 explored_trace_prefixes.add(trace_tuple[:k])
 
@@ -205,29 +219,31 @@ def execution_done():
                 seen_prefixes,
                 explored_prefixes,
                 enable_drop=ENABLE_DROP,
+                enable_delay=ENABLE_DELAY,
+                delay_s=DELAY_SECONDS,
             )
 
-            # Filter:
             filtered: List[List[str]] = []
             for p in all_new:
                 tp = tuple(p)
-
                 if tp in explored_prefixes:
                     continue
                 if tp in explored_trace_prefixes:
                     continue
-
                 filtered.append(p)
 
-            # Stable order
             new_prefixes = sorted(filtered, key=lambda x: (len(x), tuple(x)))
-
             for p in new_prefixes:
                 pending_prefixes.append(p)
 
+        # reset for next run
         trace = []
         current_result["value"] = RUN_SUCCESS
         failure_reason["value"] = ""
+        seen_base_steps_this_run = set()
+        step_attempts_this_run = defaultdict(int)
+        response_cache_this_run = {}
+        inflight_steps_this_run = set()
 
         scheduler.start_run([])
         reset_localstack_quiet()
@@ -248,11 +264,8 @@ def execution_done():
 @app.route("/", defaults={"path": ""}, methods=AWS_METHODS)
 @app.route("/<path:path>", methods=AWS_METHODS)
 def proxy(path):
-    """
-    Intercept AWS calls. Enforce prefix scheduling, record trace,
-    optionally DROP, otherwise forward to LocalStack.
-    """
-    global trace
+    global trace, seen_base_steps_this_run, step_attempts_this_run
+    global response_cache_this_run, inflight_steps_this_run
 
     client = request.headers.get("X-Client-Id", "unknown")
     thread = request.headers.get("X-Thread-Id", "unknown")
@@ -262,9 +275,45 @@ def proxy(path):
     base_step = step_key(client, thread, method, full_path)
 
     with cond:
+        # Count arrivals for debug
+        step_attempts_this_run[base_step] += 1
+        attempt_no = step_attempts_this_run[base_step]
+
+        # If this is a retry/duplicate, return cached SUCCESS instead of simulator 408.
+        if base_step in seen_base_steps_this_run:
+            # If the first attempt is still executing, wait until it's cached
+            while base_step in inflight_steps_this_run and base_step not in response_cache_this_run:
+                cond.wait(timeout=0.1)
+
+            if base_step in response_cache_this_run:
+                status, body, hdrs = response_cache_this_run[base_step]
+                print(
+                    f"[RETRY] run={run_index+1} attempt={attempt_no} duplicate -> returning cached {status}: "
+                    f"{pretty_step(base_step, parse_step)}",
+                    flush=True,
+                )
+                # Optional: log retry served (not a failure)
+                write_sim_log(
+                    parse_step,
+                    base_step,
+                    status,
+                    "Retry served from cache",
+                    run_index + 1,
+                    len(trace) + 1,
+                )
+                return Response(body, status=status, headers=hdrs)
+
+            # Extremely rare fallback: no cache (do not fail the run)
+            print(
+                f"[RETRY] run={run_index+1} attempt={attempt_no} duplicate but no cache yet -> returning 200 empty",
+                flush=True,
+            )
+            return Response(b"", status=200)
+
         ok = scheduler.wait_for_turn(base_step)
         if not ok:
-            # Run ended or not scheduled
+            # This can happen if run already ended; return 408 (client may treat as timeout)
+            # If you want to NEVER fail client here, we can also make this 200. For now keep as-is.
             write_sim_log(
                 parse_step,
                 base_step,
@@ -275,21 +324,24 @@ def proxy(path):
             )
             return Response("Blocked", status=408)
 
-        matched, was_drop = scheduler.consume_last_match()
+        matched, was_drop, was_delay, matched_delay_s = scheduler.consume_last_match()
         presented = matched if matched is not None else base_step
 
         scheduler.maybe_stop_enforcing()
 
+        # First time executing this step in this run
+        seen_base_steps_this_run.add(base_step)
+        inflight_steps_this_run.add(base_step)
+
         trace.append(presented)
         step_index = len(trace)
 
-        # Optional scheduler log (keeps your earlier debugging signal)
-        # We show "got=" if it matched a forced expected element, otherwise "free="
         if scheduler.expected_now() is None:
             print(f"[SCHED] run={run_index+1} free={pretty_step(presented, parse_step)}", flush=True)
         else:
             print(f"[SCHED] run={run_index+1} got={pretty_step(presented, parse_step)}", flush=True)
 
+        # DROP
         if was_drop:
             print(f"[DROP] run={run_index+1} {pretty_step(presented, parse_step)}", flush=True)
             write_sim_log(
@@ -300,57 +352,147 @@ def proxy(path):
                 run_index + 1,
                 step_index,
             )
+            inflight_steps_this_run.discard(base_step)
             cond.notify_all()
             return Response("Dropped", status=408)
 
-    # Forward outside lock
-    try:
-        resp = forward_to_localstack(LOCALSTACK_URL, method, path, timeout=10)
-        status = resp.status_code
-
-        if current_result["value"] == RUN_SUCCESS:
-            fail_reason = classify_http_failure(
-                status=status,
-                method=method,
-                full_path=full_path,
-                treat_404_as_fail=TREAT_404_AS_FAIL,
+        # DELAY (STRICT SYNC): hold cond for entire delay + forwarding => other threads wait
+        if was_delay and matched_delay_s > 0:
+            print(
+                f"[DELAY] run={run_index+1} step={step_index} STRICT SYNC pause {matched_delay_s}s -> "
+                f"{pretty_step(presented, parse_step)}",
+                flush=True,
             )
-            if fail_reason is not None:
-                current_result["value"] = RUN_FAILURE
-                failure_reason["value"] = fail_reason
 
-        write_sim_log(
-            parse_step,
-            base_step,
-            status,
-            f"HTTP {status}",
-            run_index + 1,
-            step_index,
-        )
+            time.sleep(matched_delay_s)
 
-        label = pretty_step(base_step, parse_step)
-        outcome = "OK" if status < 400 else f"HTTP {status}"
-        print(f"[STEP] run={run_index+1} step={step_index} {label} -> {outcome}", flush=True)
+            print(
+                f"[DELAY] run={run_index+1} step={step_index} delay finished -> forwarding now",
+                flush=True,
+            )
 
-        return Response(resp.content, status, resp.headers)
+            try:
+                resp = forward_to_localstack(LOCALSTACK_URL, method, path, timeout=10)
+                status = resp.status_code
 
-    except Exception as e:
-        if current_result["value"] == RUN_SUCCESS:
-            current_result["value"] = RUN_TIMEOUT
-            failure_reason["value"] = f"LocalStack/forwarding timeout or exception: {type(e).__name__}"
+                if current_result["value"] == RUN_SUCCESS:
+                    fail_reason = classify_http_failure(
+                        status=status,
+                        method=method,
+                        full_path=full_path,
+                        treat_404_as_fail=TREAT_404_AS_FAIL,
+                    )
+                    if fail_reason is not None:
+                        current_result["value"] = RUN_FAILURE
+                        failure_reason["value"] = fail_reason
 
-        write_sim_log(
-            parse_step,
-            base_step,
-            408,
-            "Timeout (forwarding exception)",
-            run_index + 1,
-            step_index,
-        )
+                write_sim_log(
+                    parse_step,
+                    base_step,
+                    status,
+                    f"HTTP {status}",
+                    run_index + 1,
+                    step_index,
+                )
 
-        label = pretty_step(base_step, parse_step)
-        print(f"[STEP] run={run_index+1} step={step_index} {label} -> TIMEOUT/EXCEPTION", flush=True)
-        return Response("Timeout", status=408)
+                label = pretty_step(base_step, parse_step)
+                outcome = "OK" if status < 400 else f"HTTP {status}"
+                print(
+                    f"[STEP] run={run_index+1} step={step_index} {label} -> {outcome} (LocalStack={status})",
+                    flush=True,
+                )
+
+                # Cache successful (or non-408) response for retries
+                hdrs = {k: v for k, v in resp.headers.items()}
+                response_cache_this_run[base_step] = (status, resp.content, hdrs)
+                inflight_steps_this_run.discard(base_step)
+                cond.notify_all()
+
+                return Response(resp.content, status, resp.headers)
+
+            except Exception as e:
+                # Only LocalStack/forwarding exceptions set TIMEOUT
+                if current_result["value"] == RUN_SUCCESS:
+                    current_result["value"] = RUN_TIMEOUT
+                    failure_reason["value"] = f"LocalStack/forwarding exception: {type(e).__name__}"
+
+                write_sim_log(
+                    parse_step,
+                    base_step,
+                    408,
+                    "Timeout (forwarding exception)",
+                    run_index + 1,
+                    step_index,
+                )
+
+                label = pretty_step(base_step, parse_step)
+                print(
+                    f"[STEP] run={run_index+1} step={step_index} {label} -> TIMEOUT/EXCEPTION (forward failed)",
+                    flush=True,
+                )
+
+                inflight_steps_this_run.discard(base_step)
+                cond.notify_all()
+                return Response("Timeout", status=408)
+
+        # NORMAL step
+        try:
+            resp = forward_to_localstack(LOCALSTACK_URL, method, path, timeout=10)
+            status = resp.status_code
+
+            if current_result["value"] == RUN_SUCCESS:
+                fail_reason = classify_http_failure(
+                    status=status,
+                    method=method,
+                    full_path=full_path,
+                    treat_404_as_fail=TREAT_404_AS_FAIL,
+                )
+                if fail_reason is not None:
+                    current_result["value"] = RUN_FAILURE
+                    failure_reason["value"] = fail_reason
+
+            write_sim_log(
+                parse_step,
+                base_step,
+                status,
+                f"HTTP {status}",
+                run_index + 1,
+                step_index,
+            )
+
+            label = pretty_step(base_step, parse_step)
+            outcome = "OK" if status < 400 else f"HTTP {status}"
+            print(
+                f"[STEP] run={run_index+1} step={step_index} {label} -> {outcome} (LocalStack={status})",
+                flush=True,
+            )
+
+            # Cache response for retries
+            hdrs = {k: v for k, v in resp.headers.items()}
+            response_cache_this_run[base_step] = (status, resp.content, hdrs)
+            inflight_steps_this_run.discard(base_step)
+            cond.notify_all()
+
+            return Response(resp.content, status, resp.headers)
+
+        except Exception:
+            # Only LocalStack/forwarding exceptions set TIMEOUT
+            if current_result["value"] == RUN_SUCCESS:
+                current_result["value"] = RUN_TIMEOUT
+                failure_reason["value"] = "LocalStack/forwarding exception"
+
+            write_sim_log(
+                parse_step,
+                base_step,
+                408,
+                "Timeout (forwarding exception)",
+                run_index + 1,
+                step_index,
+            )
+
+            inflight_steps_this_run.discard(base_step)
+            cond.notify_all()
+            return Response("Timeout", status=408)
 
 
 with cond:

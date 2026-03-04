@@ -5,6 +5,8 @@ import subprocess
 import sys
 from typing import Callable, Dict, List, Tuple
 
+from src.simcore.dpor import DELAY_PREFIX, delay_seconds, undelay
+
 
 def step_key(client: str, thread: str, method: str, path: str) -> str:
     return f"{client}:{thread}:{method}:{path}"
@@ -48,7 +50,15 @@ def pretty_step(step: str, parse_step: Callable[[str], Dict]) -> str:
     info = parse_step(step)
     action = s3_pretty_action(info["method"], info["path"])
     base = f"{info['client']} | {info['thread']} | {action}"
-    return f"DROP {base}" if info["is_drop"] else base
+
+    prefix = ""
+    if info.get("is_delay"):
+        sec = info.get("delay_seconds")
+        prefix += f"DELAY({sec}) " if sec is not None else "DELAY "
+    if info.get("is_drop"):
+        prefix += "DROP "
+
+    return f"{prefix}{base}".strip()
 
 
 def print_prefix(prefix: List[str], parse_step: Callable[[str], Dict]) -> None:

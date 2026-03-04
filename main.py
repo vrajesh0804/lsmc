@@ -5,6 +5,7 @@ import time
 import threading
 import subprocess
 from pathlib import Path
+from typing import Tuple, List, Optional
 
 import requests
 
@@ -33,23 +34,96 @@ def wait_ready(timeout: int = 15) -> None:
     raise RuntimeError("Simulator not reachable")
 
 
-def run_client(client_script: str) -> int:
-    # Run client as: python <client_script>
+def _classify_client_error_from_lines(lines: List[str]) -> Tuple[bool, Optional[str], str]:
+    """
+    Returns:
+      (client_had_error, error_kind, detail)
+
+    error_kind in { "TIMEOUT", "FAILURE" } or None if no error.
+    """
+    had_error = False
+    detail = ""
+
+    for ln in lines:
+        if "CLIENT_HAD_ERROR=1" in ln:
+            had_error = True
+
+    if not had_error:
+        return (False, None, "")
+
+    # Prefer the most informative line near the end
+    for ln in reversed(lines[-80:]):
+        if "FAIL" in ln or "Timeout" in ln or "TIMEOUT" in ln or "ReadTimeout" in ln or "HTTP 408" in ln:
+            detail = ln.strip()
+            break
+
+    # If client sees HTTP 408 from simulator, treat as TIMEOUT (it waited / got blocked / delay run advanced)
+    timeout_markers = [
+        "HTTP 408",
+        "ClientError 408",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "Timeout",
+        "TIMEOUT",
+    ]
+    is_timeout = any(m in detail for m in timeout_markers) if detail else True
+
+    kind = "TIMEOUT" if is_timeout else "FAILURE"
+    if not detail:
+        detail = "Client reported error (no detail line found)"
+    return (True, kind, detail)
+
+
+def run_client_streaming(client_script: str) -> Tuple[int, bool, Optional[str], str]:
+    """
+    Run client as: python <client_script>
+    Stream stdout/stderr to console (no pipe backpressure),
+    but also capture lines to classify client-level failures.
+    """
     client_abs = (PROJECT_ROOT / client_script).resolve()
     cmd = [sys.executable, str(client_abs)]
-    p = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
-    return p.returncode
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    lines: List[str] = []
+    assert p.stdout is not None
+    for line in p.stdout:
+        print(line, end="")          # keep terminal output exactly like before
+        lines.append(line.rstrip("\n"))
+
+    rc = p.wait()
+    client_had_error, client_error_kind, client_error_detail = _classify_client_error_from_lines(lines)
+    return rc, client_had_error, client_error_kind, client_error_detail
 
 
-def notify_done(exit_code: int) -> None:
-    payload = {"crash": (exit_code != 0), "exit_code": exit_code}
+def notify_done(exit_code: int, *, client_had_error: bool, client_error_kind: Optional[str], client_error_detail: str) -> None:
+    payload = {
+        "crash": (exit_code != 0),
+        "exit_code": exit_code,
+        "client_had_error": bool(client_had_error),
+        "client_error_kind": client_error_kind,         # "TIMEOUT" / "FAILURE" / None
+        "client_error_detail": client_error_detail,     # short human message
+    }
     for _ in range(3):
         try:
             requests.post(f"{SIM_URL}/__execution_done__", json=payload, timeout=30)
             return
         except requests.exceptions.ReadTimeout:
             time.sleep(1.0)
-    # last attempt failed -> bubble up
     requests.post(f"{SIM_URL}/__execution_done__", json=payload, timeout=30)
 
 
@@ -57,17 +131,37 @@ def main() -> int:
     args = sys.argv[1:]
 
     treat_404_as_fail = False
+    enable_drop = False
+    enable_delay = False
+    delay_seconds = 60
+
     if "--404-as-fail" in args:
         treat_404_as_fail = True
         args.remove("--404-as-fail")
 
-    enable_drop = False
     if "--drop" in args:
         enable_drop = True
         args.remove("--drop")
 
+    if "--delay" in args:
+        enable_delay = True
+        args.remove("--delay")
+
+    # Optional: allow --delay-seconds N (keeps your CLI future-proof)
+    if "--delay-seconds" in args:
+        i = args.index("--delay-seconds")
+        if i + 1 >= len(args):
+            print("Usage: python main.py [--delay-seconds N] ...", flush=True)
+            return 2
+        try:
+            delay_seconds = int(args[i + 1])
+        except ValueError:
+            print("ERROR: --delay-seconds must be an integer", flush=True)
+            return 2
+        del args[i:i + 2]
+
     if len(args) != 1:
-        print("Usage: python main.py [--404-as-fail] [--drop] <client_script_path>")
+        print("Usage: python main.py [--404-as-fail] [--drop] [--delay] [--delay-seconds N] <client_script_path>")
         return 2
 
     client_script = args[0]
@@ -75,6 +169,8 @@ def main() -> int:
     # Must be set BEFORE src.simulator is imported (it reads env at import time)
     os.environ["SIM_404_AS_FAIL"] = "1" if treat_404_as_fail else "0"
     os.environ["SIM_ENABLE_DROP"] = "1" if enable_drop else "0"
+    os.environ["SIM_ENABLE_DELAY"] = "1" if enable_delay else "0"
+    os.environ["SIM_DELAY_SECONDS"] = str(delay_seconds)
 
     # Start simulator in-process (daemon thread)
     t = threading.Thread(target=run_simulator, daemon=True)
@@ -102,8 +198,13 @@ def main() -> int:
 
         print(f"\n🔁 RUN #{run_no}", flush=True)
 
-        exit_code = run_client(client_script)
-        notify_done(exit_code)
+        exit_code, client_had_error, client_error_kind, client_error_detail = run_client_streaming(client_script)
+        notify_done(
+            exit_code,
+            client_had_error=client_had_error,
+            client_error_kind=client_error_kind,
+            client_error_detail=client_error_detail,
+        )
         time.sleep(0.05)
 
         run_no += 1

@@ -2,6 +2,9 @@ from typing import List, Dict, Set, Tuple
 
 DROP_PREFIX = "DROP::"
 
+# Delay is encoded as: DELAY::<seconds>::client:thread:method:path
+DELAY_PREFIX = "DELAY::"
+
 
 def is_drop(ev: str) -> bool:
     return ev.startswith(DROP_PREFIX)
@@ -15,20 +18,77 @@ def drop(ev: str) -> str:
     return ev if is_drop(ev) else (DROP_PREFIX + ev)
 
 
-def parse_step(step: str) -> Dict[str, str]:
+def is_delay(ev: str) -> bool:
+    return ev.startswith(DELAY_PREFIX)
+
+
+def delay_seconds(ev: str) -> int | None:
+    """
+    If ev is DELAY::<seconds>::..., returns seconds, else None.
+    """
+    if not is_delay(ev):
+        return None
+    # format: DELAY::<sec>::<rest>
+    rest = ev[len(DELAY_PREFIX):]
+    parts = rest.split("::", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0])
+    except Exception:
+        return None
+
+
+def undelay(ev: str) -> str:
+    """
+    DELAY::<seconds>::client:thread:method:path  ->  client:thread:method:path
+    """
+    if not is_delay(ev):
+        return ev
+    rest = ev[len(DELAY_PREFIX):]
+    parts = rest.split("::", 1)
+    if len(parts) != 2:
+        # malformed; best-effort fallback
+        return ev
+    return parts[1]
+
+
+def delay(ev: str, seconds: int) -> str:
+    """
+    Wrap event as delayed. If already delayed, keep as-is.
+    """
+    return ev if is_delay(ev) else f"{DELAY_PREFIX}{int(seconds)}::{ev}"
+
+
+def parse_step(step: str) -> Dict[str, object]:
     """
     step format:
-      normal:    client:thread:method:path
-      dropped:   DROP::client:thread:method:path
+      normal:            client:thread:method:path
+      dropped:           DROP::client:thread:method:path
+      delayed:           DELAY::<sec>::client:thread:method:path
+      dropped+delayed:   DROP::DELAY::<sec>::client:thread:method:path   (supported)
     """
-    raw = undrop(step)
+    raw = step
+
+    # support nesting in either order
+    is_d = is_drop(raw)
+    if is_d:
+        raw = undrop(raw)
+
+    is_l = is_delay(raw)
+    sec = delay_seconds(raw) if is_l else None
+    if is_l:
+        raw = undelay(raw)
+
     client, thread, method, path = raw.split(":", 3)
     return {
         "client": client,
         "thread": thread,
         "method": method,
         "path": path,
-        "is_drop": is_drop(step),
+        "is_drop": is_d,
+        "is_delay": is_l,
+        "delay_seconds": sec,
     }
 
 
@@ -38,7 +98,7 @@ def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
     including the minimal same-thread prerequisites needed for feasibility.
 
     This helper ONLY preserves per-thread program order. It does NOT model
-    data/control dependencies across threads (e.g., "delete happens only if head==200").
+    data/control dependencies across threads.
     """
     assert 0 <= i < j < len(trace)
 
@@ -73,34 +133,26 @@ def generate_forced_prefixes(
     explored_prefixes: Set[Tuple[str, ...]],
     *,
     enable_drop: bool = False,
+    enable_delay: bool = False,
+    delay_s: int = 60,
 ) -> List[List[str]]:
     """
-    Generate only *feasible-by-construction* forced prefixes for your simulator.
-
-    Key design goals (given "no client changes"):
-      1) Avoid infeasible forced prefixes that can deadlock enforcement (CRASH),
-         especially in workloads with control/data dependencies (e.g., C depends on B==True).
-      2) Keep exploration deterministic: after forced prefix is satisfied, your scheduler's
-         FREE mode completes the run deterministically.
+    Generate forced prefixes.
 
     Strategy:
-      (A) SWAPS: Only consider swaps of *adjacent* cross-thread events in the observed trace.
-          - This is a conservative DPOR heuristic that avoids generating long-range swaps
-            like moving C (delete) ahead of A when C is control-dependent on earlier results.
-          - It also preserves per-thread order via minimal_prefix_for_swap.
+      (A) SWAPS: adjacent cross-thread swaps only (conservative DPOR heuristic)
+      (B) DROP mutations: prefix up to i+1, with event i replaced by DROP::event (if enabled)
+      (C) DELAY mutations: prefix up to i+1, with event i replaced by DELAY::<s>::event (if enabled)
 
-      (B) DROP MUTATIONS: Generate DROP prefixes only up to the mutation point (length i+1),
-          not full-trace "DROP schedules". This prevents forcing steps that may disappear
-          due to branching (e.g., delete not executed when head returns 404/408).
-
-    This eliminates prefixes like [B, C, A] for your conditional example, and therefore
-    eliminates the forced-prefix timeouts (CRASH) caused by demanding an impossible step.
+    DELAY is implemented "exactly like DROP" (same prefix shape), but simulator behavior differs:
+      - DROP => returns 408 immediately
+      - DELAY => sleeps then forwards, likely causing client-side timeouts
     """
     new_prefixes: List[List[str]] = []
     parsed = [parse_step(s) for s in trace]
     n = len(trace)
 
-    # (A) Adjacent cross-thread swaps only (conservative, feasibility-oriented)
+    # (A) Adjacent cross-thread swaps only
     for i in range(n - 1):
         j = i + 1
         if parsed[i]["thread"] == parsed[j]["thread"]:
@@ -113,12 +165,11 @@ def generate_forced_prefixes(
         seen_prefixes.add(tp)
         new_prefixes.append(swapped_prefix)
 
-    # (B) DROP mutation prefixes only up to the dropped event
+    # (B) DROP mutation prefixes
     if enable_drop:
         for i in range(n):
             if is_drop(trace[i]):
                 continue
-
             drop_prefix = list(trace[: i + 1])
             drop_prefix[i] = drop(drop_prefix[i])
 
@@ -127,5 +178,19 @@ def generate_forced_prefixes(
                 continue
             seen_prefixes.add(tp)
             new_prefixes.append(drop_prefix)
+
+    # (C) DELAY mutation prefixes (same construction as DROP)
+    if enable_delay:
+        for i in range(n):
+            if is_delay(trace[i]):
+                continue
+            delay_prefix = list(trace[: i + 1])
+            delay_prefix[i] = delay(delay_prefix[i], delay_s)
+
+            tp = tuple(delay_prefix)
+            if tp in seen_prefixes or tp in explored_prefixes:
+                continue
+            seen_prefixes.add(tp)
+            new_prefixes.append(delay_prefix)
 
     return new_prefixes

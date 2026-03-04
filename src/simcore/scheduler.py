@@ -1,9 +1,8 @@
-# src/simcore/scheduler.py
 import os
 import time
 from typing import List, Optional, Tuple, Set
 
-from src.simcore.dpor import DROP_PREFIX, undrop
+from src.simcore.dpor import DROP_PREFIX, undrop, DELAY_PREFIX, undelay, delay_seconds
 
 RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
@@ -24,11 +23,13 @@ class PrefixScheduler:
 
     def __init__(
         self,
+        *,
         cond,
         deadlock_timeout_s: int,
         current_result_ref: dict,
         failure_reason_ref: dict,
     ):
+        # IMPORTANT: keep `cond` keyword arg API (your simulator calls PrefixScheduler(cond=cond,...))
         self.cond = cond
         self.deadlock_timeout_s = deadlock_timeout_s
         self.current_result_ref = current_result_ref
@@ -45,16 +46,17 @@ class PrefixScheduler:
         self._last_matched_step: Optional[str] = None
         self._last_was_drop: bool = False
 
+        # NEW: delay info
+        self._last_was_delay: bool = False
+        self._last_delay_s: int = 0
+
         # FREE-run determinism knobs
         self._free_gather_ms = int(os.environ.get("SIM_FREE_GATHER_MS", "50"))
-        # Wait for at least this many unique threads before choosing the FIRST free step
         self._free_min_unique_threads = int(os.environ.get("SIM_FREE_MIN_THREADS", "2"))
 
         # FREE-run state
         self._free_waiting: List[str] = []
         self._free_released_count: int = 0
-
-        # per-step gather deadline (not only first step)
         self._free_deadline: Optional[float] = None
         self._free_seen_threads: Set[str] = set()
 
@@ -68,6 +70,8 @@ class PrefixScheduler:
 
         self._last_matched_step = None
         self._last_was_drop = False
+        self._last_was_delay = False
+        self._last_delay_s = 0
 
         # reset FREE-run state
         self._free_waiting = []
@@ -90,20 +94,39 @@ class PrefixScheduler:
             self.enforcing = False
             self.cond.notify_all()
 
-    def consume_last_match(self) -> Tuple[Optional[str], bool]:
+    def consume_last_match(self) -> Tuple[Optional[str], bool, bool, int]:
+        """
+        Returns: (matched_step_or_None, was_drop, was_delay, delay_seconds)
+
+        - matched_step_or_None:
+            * enforcing: the expected token (so includes DROP/DELAY wrapper)
+            * free mode: the presented step
+        - was_drop:
+            True if the expected token was DROP::... (or DROP::DELAY::...)
+        - was_delay:
+            True if the expected token was DELAY::... (or DROP::DELAY::...)
+        - delay_seconds:
+            parsed seconds (0 if not delayed or malformed)
+        """
         ms = self._last_matched_step
         wd = self._last_was_drop
+        wdel = self._last_was_delay
+        ds = self._last_delay_s
+
         self._last_matched_step = None
         self._last_was_drop = False
-        return ms, wd
+        self._last_was_delay = False
+        self._last_delay_s = 0
+        return ms, wd, wdel, ds
 
     @staticmethod
-    def _extract_thread(presented_step: str) -> str:
-        """
-        presented_step format: client:thread:method:path (or DROP::client:thread:...)
-        We'll parse only enough to get thread.
-        """
-        raw = undrop(presented_step)
+    def _extract_thread(step: str) -> str:
+        # step may include DROP/DELAY wrappers
+        raw = step
+        if raw.startswith(DROP_PREFIX):
+            raw = undrop(raw)
+        if raw.startswith(DELAY_PREFIX):
+            raw = undelay(raw)
         parts = raw.split(":", 3)
         if len(parts) >= 2:
             return parts[1]
@@ -117,37 +140,24 @@ class PrefixScheduler:
                 self._free_deadline = time.time() + (self._free_gather_ms / 1000.0)
 
     def _free_reset_for_next_choice(self) -> None:
-        """
-        After we choose one step, we start a new gather window for the next choice.
-        """
         self._free_deadline = None
-        # Keep _free_seen_threads across the whole run (helps first-step rule only)
 
     def wait_for_turn(self, presented_step: str) -> bool:
-        """
-        Blocks until:
-          - run ended => False
-          - FREE run => deterministic selection (gather each step, choose min)
-          - enforcing => matches expected step (incl. DROP expectation)
-        """
         while True:
             if self.current_result_ref["value"] != RUN_SUCCESS:
                 return False
 
             # ---------- FREE RUN ----------
             if not self.enforcing:
-                # record contender
                 if presented_step not in self._free_waiting:
                     self._free_waiting.append(presented_step)
 
-                # record seen thread (for first-step stability)
                 tname = self._extract_thread(presented_step)
                 self._free_seen_threads.add(tname)
 
-                # start gather window for this free decision
                 self._free_set_deadline_if_needed()
 
-                # FIRST FREE CHOICE: optionally wait for >= N unique threads (or deadline)
+                # first free decision: optionally wait for >= N unique threads
                 if self._free_released_count == 0 and self._free_min_unique_threads > 1:
                     if len(self._free_seen_threads) < self._free_min_unique_threads:
                         now = time.time()
@@ -155,7 +165,6 @@ class PrefixScheduler:
                             self.cond.wait(timeout=max(0.0, (self._free_deadline or now) - now))
                             continue
 
-                # For ALL free choices: wait until gather deadline expires
                 now = time.time()
                 if self._free_deadline is not None and now < self._free_deadline:
                     self.cond.wait(timeout=max(0.0, self._free_deadline - now))
@@ -172,9 +181,10 @@ class PrefixScheduler:
 
                     self._last_matched_step = presented_step
                     self._last_was_drop = False
+                    self._last_was_delay = False
+                    self._last_delay_s = 0
                     self._last_progress_at = time.time()
 
-                    # prepare next free decision
                     self._free_reset_for_next_choice()
                     return True
 
@@ -184,25 +194,66 @@ class PrefixScheduler:
             # ---------- ENFORCING ----------
             exp = self.expected_now()
 
-            # exact match
+            # exact match (rare; usually presented is unwrapped)
             if exp == presented_step:
                 self.forced_pos += 1
-                self._last_matched_step = exp
-                self._last_was_drop = bool(exp and exp.startswith(DROP_PREFIX))
+                self._set_last_match_from_expected(exp)
                 self._last_progress_at = time.time()
                 return True
 
-            # expected is DROP::<X>, but presented is <X>
+            # expected DROP::X but presented X
             if exp and exp.startswith(DROP_PREFIX) and undrop(exp) == presented_step:
                 self.forced_pos += 1
-                self._last_matched_step = exp
-                self._last_was_drop = True
+                self._set_last_match_from_expected(exp)
                 self._last_progress_at = time.time()
                 return True
+
+            # expected DELAY::<s>::X but presented X
+            if exp and exp.startswith(DELAY_PREFIX) and undelay(exp) == presented_step:
+                self.forced_pos += 1
+                self._set_last_match_from_expected(exp)
+                self._last_progress_at = time.time()
+                return True
+
+            # expected DROP::DELAY::<s>::X but presented X
+            if exp and exp.startswith(DROP_PREFIX):
+                inner = undrop(exp)
+                if inner.startswith(DELAY_PREFIX) and undelay(inner) == presented_step:
+                    self.forced_pos += 1
+                    self._set_last_match_from_expected(exp)
+                    self._last_progress_at = time.time()
+                    return True
 
             self.cond.wait(timeout=0.1)
 
+    def _set_last_match_from_expected(self, exp: Optional[str]) -> None:
+        """
+        exp is the forced expected token (may be wrapped).
+        """
+        self._last_matched_step = exp
+
+        self._last_was_drop = bool(exp and exp.startswith(DROP_PREFIX))
+
+        # delay may be outer (DELAY::...) or inner (DROP::DELAY::...)
+        self._last_was_delay = False
+        self._last_delay_s = 0
+
+        if not exp:
+            return
+
+        if exp.startswith(DELAY_PREFIX):
+            self._last_was_delay = True
+            self._last_delay_s = int(delay_seconds(exp) or 0)
+            return
+
+        if exp.startswith(DROP_PREFIX):
+            inner = undrop(exp)
+            if inner.startswith(DELAY_PREFIX):
+                self._last_was_delay = True
+                self._last_delay_s = int(delay_seconds(inner) or 0)
+
     def watchdog_tick(self) -> None:
+        # Preserve your semantics: watchdog only matters while enforcing
         if self.current_result_ref["value"] != RUN_SUCCESS:
             return
         if not self.enforcing:
