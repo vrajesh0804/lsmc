@@ -101,7 +101,7 @@ def run_client_streaming(client_script: str) -> Tuple[int, bool, Optional[str], 
     lines: List[str] = []
     assert p.stdout is not None
     for line in p.stdout:
-        print(line, end="")          # keep terminal output exactly like before
+        print(line, end="")  # keep terminal output exactly like before
         lines.append(line.rstrip("\n"))
 
     rc = p.wait()
@@ -109,13 +109,19 @@ def run_client_streaming(client_script: str) -> Tuple[int, bool, Optional[str], 
     return rc, client_had_error, client_error_kind, client_error_detail
 
 
-def notify_done(exit_code: int, *, client_had_error: bool, client_error_kind: Optional[str], client_error_detail: str) -> None:
+def notify_done(
+    exit_code: int,
+    *,
+    client_had_error: bool,
+    client_error_kind: Optional[str],
+    client_error_detail: str,
+) -> None:
     payload = {
         "crash": (exit_code != 0),
         "exit_code": exit_code,
         "client_had_error": bool(client_had_error),
-        "client_error_kind": client_error_kind,         # "TIMEOUT" / "FAILURE" / None
-        "client_error_detail": client_error_detail,     # short human message
+        "client_error_kind": client_error_kind,      # "TIMEOUT" / "FAILURE" / None
+        "client_error_detail": client_error_detail,  # short human message
     }
     for _ in range(3):
         try:
@@ -133,8 +139,11 @@ def main() -> int:
     enable_drop = False
     enable_delay = False
 
-    # ✅ New default when --delay is enabled
+    # ✅ Default delay when --delay is enabled: 120s (2 minutes)
     delay_seconds = 20
+
+    # Optional: override forced-prefix timeout (seconds)
+    forced_prefix_timeout: Optional[int] = None
 
     if "--404-as-fail" in args:
         treat_404_as_fail = True
@@ -148,13 +157,23 @@ def main() -> int:
         enable_delay = True
         args.remove("--delay")
 
+    # NEW: --forced-prefix-timeout N
+    if "--forced-prefix-timeout" in args:
+        i = args.index("--forced-prefix-timeout")
+        if i + 1 >= len(args):
+            print("Usage: python main.py [--forced-prefix-timeout N] ...", flush=True)
+            return 2
+        try:
+            forced_prefix_timeout = int(args[i + 1])
+        except ValueError:
+            print("ERROR: --forced-prefix-timeout must be an integer", flush=True)
+            return 2
+        del args[i : i + 2]
+
     # ✅ NEW: --delay-for-<N>
-    # - only applies if --delay was provided
-    # - otherwise it's ignored (removed from args)
     delay_for_val: Optional[int] = None
     delay_for_tokens = [a for a in args if a.startswith("--delay-for-")]
     if delay_for_tokens:
-        # allow only one occurrence
         if len(delay_for_tokens) > 1:
             print("ERROR: use only one --delay-for-<N>", flush=True)
             return 2
@@ -164,12 +183,11 @@ def main() -> int:
 
         s = tok[len("--delay-for-") :]
         if not s.isdigit():
-            print("ERROR: --delay-for-<N> requires integer N, e.g. --delay-for-100", flush=True)
+            print("ERROR: --delay-for-<N> requires integer N, e.g. --delay-for-120", flush=True)
             return 2
         delay_for_val = int(s)
 
     # Optional (kept): --delay-seconds N
-    # If used, it behaves like --delay-for-<N> but requires --delay too.
     if "--delay-seconds" in args:
         i = args.index("--delay-seconds")
         if i + 1 >= len(args):
@@ -180,7 +198,7 @@ def main() -> int:
         except ValueError:
             print("ERROR: --delay-seconds must be an integer", flush=True)
             return 2
-        del args[i:i + 2]
+        del args[i : i + 2]
 
         if delay_for_val is not None:
             print("ERROR: use either --delay-for-<N> OR --delay-seconds N (not both)", flush=True)
@@ -188,28 +206,30 @@ def main() -> int:
         delay_for_val = val
 
     # Apply delay override only if --delay was actually enabled
-    if enable_delay:
-        if delay_for_val is not None:
-            delay_seconds = delay_for_val
-    else:
-        # --delay is not present => ignore any delay-for/delay-seconds
-        # (we already removed delay-for token; delay-seconds would have been parsed above)
-        pass
+    if enable_delay and delay_for_val is not None:
+        delay_seconds = delay_for_val
 
     if len(args) != 1:
         print(
             "Usage: python main.py [--404-as-fail] [--drop] [--delay] "
-            "[--delay-for-<N>] [--delay-seconds N] <client_script_path>"
+            "[--delay-for-<N>] [--delay-seconds N] [--forced-prefix-timeout N] <client_script_path>",
+            flush=True,
         )
         return 2
 
     client_script = args[0]
+
+    # Auto forced-prefix timeout:
+    # If delay is enabled, ensure timeout > delay so we don't falsely TIMEOUT during enforced DELAY.
+    if forced_prefix_timeout is None:
+        forced_prefix_timeout = max(60, delay_seconds + 30) if enable_delay else 60
 
     # Must be set BEFORE src.simulator is imported (it reads env at import time)
     os.environ["SIM_404_AS_FAIL"] = "1" if treat_404_as_fail else "0"
     os.environ["SIM_ENABLE_DROP"] = "1" if enable_drop else "0"
     os.environ["SIM_ENABLE_DELAY"] = "1" if enable_delay else "0"
     os.environ["SIM_DELAY_SECONDS"] = str(delay_seconds)
+    os.environ["SIM_FORCED_PREFIX_TIMEOUT"] = str(forced_prefix_timeout)
 
     # Start simulator in-process (daemon thread)
     t = threading.Thread(target=run_simulator, daemon=True)
@@ -245,7 +265,6 @@ def main() -> int:
             client_error_detail=client_error_detail,
         )
         time.sleep(0.05)
-
         run_no += 1
 
     return 0
