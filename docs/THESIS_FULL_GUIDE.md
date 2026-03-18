@@ -103,7 +103,7 @@ The repeated execution loop is central. One run produces one trace. That trace l
 The command-line usage currently follows this form:
 
 ```bash
-python main.py [--404-as-fail] [--drop] [--delay] [--delay-for-<N>] [--delay-seconds N] [--forced-prefix-timeout N] <client_script_path>
+python main.py [--404-as-fail] [--drop] [--delay] [--delay-for-N] [--408-as-timeout] <client_script_path>
 ```
 
 ---
