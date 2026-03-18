@@ -14,11 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def run_simulator():
-    # Import inside the thread so env vars are set before module import
-    from src.simulator import app
-
-    print("[SIM] Simulator started on http://localhost:9998", flush=True)
-    app.run(host="0.0.0.0", port=9998, threaded=True)
+    try:
+        from src.simulator import app
+        print("[SIM] Simulator started on http://localhost:9998", flush=True)
+        app.run(host="0.0.0.0", port=9998, threaded=True)
+    except Exception as e:
+        import traceback
+        print(f"[SIM] Simulator thread crashed: {e}", flush=True)
+        traceback.print_exc()
 
 
 def wait_ready(timeout: int = 15) -> None:
@@ -34,12 +37,21 @@ def wait_ready(timeout: int = 15) -> None:
     raise RuntimeError("Simulator not reachable")
 
 
-def _classify_client_error_from_lines(lines: List[str]) -> Tuple[bool, Optional[str], str]:
+def _classify_client_error_from_lines(
+    lines: List[str],
+    *,
+    treat_408_as_timeout: bool,
+) -> Tuple[bool, Optional[str], str]:
     """
     Returns:
       (client_had_error, error_kind, detail)
 
     error_kind in { "TIMEOUT", "FAILURE" } or None if no error.
+
+    Important:
+      - HTTP 408 is treated as TIMEOUT only when --408-as-timeout is enabled.
+      - Otherwise HTTP 408 is ignored here so simulator-side classification can decide
+        whether it should count as SUCCESS.
     """
     had_error = False
     detail = ""
@@ -51,21 +63,32 @@ def _classify_client_error_from_lines(lines: List[str]) -> Tuple[bool, Optional[
     if not had_error:
         return (False, None, "")
 
-    # Prefer the most informative line near the end
-    for ln in reversed(lines[-80:]):
-        if "FAIL" in ln or "Timeout" in ln or "TIMEOUT" in ln or "ReadTimeout" in ln or "HTTP 408" in ln:
-            detail = ln.strip()
-            break
+    candidates = list(reversed(lines[-80:]))
+    saw_408 = any(("HTTP 408" in ln or "ClientError 408" in ln) for ln in candidates)
 
     timeout_markers = [
-        "HTTP 408",
-        "ClientError 408",
         "ReadTimeout",
         "ReadTimeoutError",
         "Timeout",
         "TIMEOUT",
     ]
-    is_timeout = any(m in detail for m in timeout_markers) if detail else True
+    if treat_408_as_timeout:
+        timeout_markers.extend(["HTTP 408", "ClientError 408"])
+
+    for ln in candidates:
+        if "FAIL" in ln or any(m in ln for m in timeout_markers) or (treat_408_as_timeout and "HTTP 408" in ln):
+            detail = ln.strip()
+            break
+
+    # When --408-as-timeout is OFF, a client-side HTTP 408 should not downgrade the run.
+    if saw_408 and not treat_408_as_timeout:
+        other_timeout = any(
+            (m in detail) for m in ["ReadTimeout", "ReadTimeoutError", "Timeout", "TIMEOUT"]
+        ) if detail else False
+        if not other_timeout:
+            return (False, None, "")
+
+    is_timeout = any(m in detail for m in timeout_markers) if detail else False
 
     kind = "TIMEOUT" if is_timeout else "FAILURE"
     if not detail:
@@ -105,7 +128,10 @@ def run_client_streaming(client_script: str) -> Tuple[int, bool, Optional[str], 
         lines.append(line.rstrip("\n"))
 
     rc = p.wait()
-    client_had_error, client_error_kind, client_error_detail = _classify_client_error_from_lines(lines)
+    client_had_error, client_error_kind, client_error_detail = _classify_client_error_from_lines(
+        lines,
+        treat_408_as_timeout=(env.get("SIM_408_AS_TIMEOUT", "0") == "1"),
+    )
     return rc, client_had_error, client_error_kind, client_error_detail
 
 
@@ -138,6 +164,7 @@ def main() -> int:
     treat_404_as_fail = False
     enable_drop = False
     enable_delay = False
+    treat_408_as_timeout = False
 
     # ✅ Default delay when --delay is enabled: 120s (2 minutes)
     delay_seconds = 20
@@ -156,6 +183,10 @@ def main() -> int:
     if "--delay" in args:
         enable_delay = True
         args.remove("--delay")
+
+    if "--408-as-timeout" in args:
+        treat_408_as_timeout = True
+        args.remove("--408-as-timeout")
 
     # NEW: --forced-prefix-timeout N
     if "--forced-prefix-timeout" in args:
@@ -211,7 +242,7 @@ def main() -> int:
 
     if len(args) != 1:
         print(
-            "Usage: python main.py [--404-as-fail] [--drop] [--delay] "
+            "Usage: python main.py [--404-as-fail] [--408-as-timeout] [--drop] [--delay] "
             "[--delay-for-<N>] [--delay-seconds N] [--forced-prefix-timeout N] <client_script_path>",
             flush=True,
         )
@@ -226,6 +257,7 @@ def main() -> int:
 
     # Must be set BEFORE src.simulator is imported (it reads env at import time)
     os.environ["SIM_404_AS_FAIL"] = "1" if treat_404_as_fail else "0"
+    os.environ["SIM_408_AS_TIMEOUT"] = "1" if treat_408_as_timeout else "0"
     os.environ["SIM_ENABLE_DROP"] = "1" if enable_drop else "0"
     os.environ["SIM_ENABLE_DELAY"] = "1" if enable_delay else "0"
     os.environ["SIM_DELAY_SECONDS"] = str(delay_seconds)

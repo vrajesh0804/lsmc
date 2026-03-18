@@ -77,12 +77,24 @@ def classify_http_failure(
     method: str,
     full_path: str,
     treat_404_as_fail: bool,
-) -> str | None:
+    treat_408_as_timeout: bool,
+) -> tuple[str, str] | None:
+    """
+    Returns:
+      None                      -> count as success
+      ("FAILURE", reason)      -> count as failure
+      ("TIMEOUT", reason)      -> count as timeout
+    """
     if status == 404 and not treat_404_as_fail:
         return None
 
+    if status == 408:
+        if treat_408_as_timeout:
+            return ("TIMEOUT", f"{method} {full_path} → 408")
+        return None
+
     if status >= 400:
-        return f"{method} {full_path} → {status}"
+        return ("FAILURE", f"{method} {full_path} → {status}")
 
     return None
 

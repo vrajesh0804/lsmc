@@ -243,15 +243,17 @@ def proxy(state, cfg, path: str, method: str):
 
         with state.cond:
             if state.current_result["value"] == RUN_SUCCESS:
-                fail_reason = classify_http_failure(
+                classified = classify_http_failure(
                     status=status,
                     method=method,
                     full_path=full_path,
                     treat_404_as_fail=cfg.treat_404_as_fail,
+                    treat_408_as_timeout=cfg.treat_408_as_timeout,
                 )
-                if fail_reason is not None:
-                    state.current_result["value"] = RUN_FAILURE
-                    state.failure_reason["value"] = fail_reason
+                if classified is not None:
+                    kind, reason = classified
+                    state.current_result["value"] = RUN_TIMEOUT if kind == "TIMEOUT" else RUN_FAILURE
+                    state.failure_reason["value"] = reason
 
             write_sim_log(parse_step, base_step, status, f"HTTP {status}", state.run_index + 1, step_index)
 
@@ -276,7 +278,7 @@ def proxy(state, cfg, path: str, method: str):
 
     except Exception as e:
         with state.cond:
-            if state.current_result["value"] == RUN_SUCCESS:
+            if state.current_result["value"] == RUN_SUCCESS and cfg.treat_408_as_timeout:
                 state.current_result["value"] = RUN_TIMEOUT
                 state.failure_reason["value"] = f"LocalStack/forwarding exception: {type(e).__name__}"
 

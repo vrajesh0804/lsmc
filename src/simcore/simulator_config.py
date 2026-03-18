@@ -12,6 +12,7 @@ LOCALSTACK_URL = "http://localhost:9999"
 class SimConfig:
     forced_prefix_deadlock_timeout: int
     treat_404_as_fail: bool
+    treat_408_as_timeout: bool
     enable_drop: bool
     enable_delay: bool
     delay_seconds: int
@@ -22,6 +23,7 @@ def load_config() -> SimConfig:
     forced = int(os.environ.get("SIM_FORCED_PREFIX_TIMEOUT", "60"))
 
     treat_404 = os.environ.get("SIM_404_AS_FAIL", "0") == "1"
+    treat_408 = os.environ.get("SIM_408_AS_TIMEOUT", "0") == "1"
     enable_drop = os.environ.get("SIM_ENABLE_DROP", "0") == "1"
     enable_delay = os.environ.get("SIM_ENABLE_DELAY", "0") == "1"
     delay_s = int(os.environ.get("SIM_DELAY_SECONDS", "60"))
@@ -35,6 +37,7 @@ def load_config() -> SimConfig:
     return SimConfig(
         forced_prefix_deadlock_timeout=forced,
         treat_404_as_fail=treat_404,
+        treat_408_as_timeout=treat_408,
         enable_drop=enable_drop,
         enable_delay=enable_delay,
         delay_seconds=delay_s,
@@ -44,6 +47,7 @@ def load_config() -> SimConfig:
 
 def print_config(cfg: SimConfig) -> None:
     print(f"[SIM] 404 treated as failure: {cfg.treat_404_as_fail}", flush=True)
+    print(f"[SIM] 408 treated as timeout: {cfg.treat_408_as_timeout}", flush=True)
     print(f"[SIM] DROP enabled: {cfg.enable_drop}", flush=True)
     print(f"[SIM] DELAY enabled: {cfg.enable_delay} (seconds={cfg.delay_seconds})", flush=True)
     print(f"[SIM] PHASE order: {cfg.phase_order}", flush=True)
