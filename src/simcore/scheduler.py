@@ -19,8 +19,6 @@ class PrefixScheduler:
       - pick lexicographically smallest presented_step among buffered contenders
       - (optional) for the very first free decision, wait until we have seen
         at least N unique threads, or until the gather window expires
-
-    ✅ New thesis semantics / functionality:
       - Watchdog timeout while enforcing forced prefix => RUN_TIMEOUT (not RUN_CRASH)
       - When --drop and --delay are used together:
           * We allow forced tokens of the form DROP::<step> OR DELAY::<s>::<step>
@@ -39,24 +37,28 @@ class PrefixScheduler:
         current_result_ref: dict,
         failure_reason_ref: dict,
     ):
+        """
+            cond : A condition variable for synchronization between threads.
+            deadlock_timeout_s : How long to wait before declaring timeout during forced prefix enforcement.
+            current_result_ref : A shared dictionary holding current run result
+            failure_reason_ref : Shared dictionary storing failure explanation string.
+        """
         # IMPORTANT: keep `cond` keyword arg API
         self.cond = cond
         self.deadlock_timeout_s = deadlock_timeout_s
         self.current_result_ref = current_result_ref
         self.failure_reason_ref = failure_reason_ref
 
-        self.forced_prefix: List[str] = []
-        self.enforcing: bool = False
-        self.forced_pos: int = 0
+        self.forced_prefix: List[str] = [] # the prefix we want to enforce
+        self.enforcing: bool = False # whether we are currently enforcing
+        self.forced_pos: int = 0 # which position in forced prefix we are waiting for now
 
-        now = time.time()
-        self._last_progress_at: float = now
+        now = time.time() # current time
+        self._last_progress_at: float = now # Stores last time a forced step successfully matched.
 
         # last match info (set by wait_for_turn, read by simulator)
         self._last_matched_step: Optional[str] = None
         self._last_was_drop: bool = False
-
-        # delay info
         self._last_was_delay: bool = False
         self._last_delay_s: int = 0
 
@@ -71,6 +73,7 @@ class PrefixScheduler:
         self._free_seen_threads: Set[str] = set()
 
     def start_run(self, forced_prefix: List[str]) -> None:
+        # Starts a new run with a given forced prefix.
         self.forced_prefix = list(forced_prefix)
         self.enforcing = len(self.forced_prefix) > 0
         self.forced_pos = 0
@@ -92,14 +95,17 @@ class PrefixScheduler:
         self.cond.notify_all()
 
     def expected_now(self) -> Optional[str]:
+        # Returns the next forced token we are currently expecting.
         if self.enforcing and self.forced_pos < len(self.forced_prefix):
             return self.forced_prefix[self.forced_pos]
         return None
 
     def is_prefix_complete(self) -> bool:
+        # Checks whether forced prefix is already fully matched.
         return (not self.enforcing) or (self.forced_pos >= len(self.forced_prefix))
 
     def maybe_stop_enforcing(self) -> None:
+        # If forced prefix is fully consumed, turn off enforcement.
         if self.enforcing and self.forced_pos >= len(self.forced_prefix):
             self.enforcing = False
             self.cond.notify_all()
@@ -118,6 +124,8 @@ class PrefixScheduler:
         - delay_seconds:
             parsed seconds (0 if not delayed or malformed)
         """
+        # Scheduler only decides who is allowed.
+        # But simulator needs to know how to execute it.
         ms = self._last_matched_step
         wd = self._last_was_drop
         wdel = self._last_was_delay
@@ -146,6 +154,7 @@ class PrefixScheduler:
     @staticmethod
     def _extract_thread(step: str) -> str:
         # step may include DROP/DELAY wrappers
+        # Extracts thread name from a step, even if wrapped by DROP/DELAY.
         raw = step
         if raw.startswith(DROP_PREFIX):
             raw = undrop(raw)
@@ -157,6 +166,7 @@ class PrefixScheduler:
         return "unknown"
 
     def _free_set_deadline_if_needed(self) -> None:
+        # If no gather deadline exists yet, set one.
         if self._free_deadline is None:
             if self._free_gather_ms <= 0:
                 self._free_deadline = time.time()
@@ -164,9 +174,17 @@ class PrefixScheduler:
                 self._free_deadline = time.time() + (self._free_gather_ms / 1000.0)
 
     def _free_reset_for_next_choice(self) -> None:
+        # Resets free-mode deadline after one choice is made.
         self._free_deadline = None
 
     def wait_for_turn(self, presented_step: str) -> bool:
+        """
+            This is the heart of the scheduler.
+            Each thread calls this when it wants to execute a step.
+            The scheduler blocks until:
+            step is allowed, then returns True
+            or run already failed/timed out, then returns False
+        """
         while True:
             if self.current_result_ref["value"] != RUN_SUCCESS:
                 return False
@@ -257,6 +275,7 @@ class PrefixScheduler:
         exp is the forced expected token (may be wrapped).
         Nested wrappers are disallowed; this function assumes non-nested exp.
         """
+        # Stores metadata for the last matched forced token.
         self._last_matched_step = exp
         self._last_was_drop = bool(exp and exp.startswith(DROP_PREFIX))
 

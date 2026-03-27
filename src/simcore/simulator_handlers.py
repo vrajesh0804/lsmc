@@ -1,4 +1,3 @@
-# src/simcore/simulator_handlers.py
 from flask import request, Response
 from typing import List, Tuple
 from collections import defaultdict
@@ -15,11 +14,12 @@ from src.simcore.sim_helpers import (
     reset_localstack_quiet,
 )
 
-from src.simcore.simulator_cache import artifact_response_for, cache_response
+from src.simcore.simulator_cache import artifact_response_for
 from src.simcore.simulator_prefixes import pick_next_prefix_or_done, prefix_sort_key
 
 
 def print_final_summary(results_list: List[Tuple[str, str]]) -> None:
+    # Final Summary
     success = sum(1 for r, _ in results_list if r == RUN_SUCCESS)
     failure = sum(1 for r, _ in results_list if r == RUN_FAILURE)
     crash = sum(1 for r, _ in results_list if r == RUN_CRASH)
@@ -37,6 +37,7 @@ def ready(state):
 
 
 def execution_done(state, cfg):
+    # When one execution ends, this function decides what to do next.
     payload = request.get_json(silent=True) or {}
     is_crash = bool(payload.get("crash"))
     exit_code = payload.get("exit_code")
@@ -49,8 +50,9 @@ def execution_done(state, cfg):
         state.run_index += 1
 
         # CRASH -> TIMEOUT if SUCCESS
+        # Crash handling
         if is_crash and state.current_result["value"] == RUN_SUCCESS:
-            state.current_result["value"] = RUN_TIMEOUT
+            state.current_result["value"] = RUN_TIMEOUT # if client crashed, and simulator had not already set a result,
             state.failure_reason["value"] = f"Client crash treated as timeout (exit code {exit_code})"
 
         if (not is_crash) and client_had_error and state.current_result["value"] == RUN_SUCCESS:
@@ -64,10 +66,11 @@ def execution_done(state, cfg):
         status = state.current_result["value"]
         reason = state.failure_reason["value"]
 
-        state.explored_prefixes.add(tuple(state.forced_prefix))
-        trace_tuple = tuple(state.trace)
+        state.explored_prefixes.add(tuple(state.forced_prefix)) # mark forced prefix explored
+        trace_tuple = tuple(state.trace) # deduplicate same trace
 
         # HARD TRACE DEDUPE includes TIMEOUT
+        # If this exact trace already happened before, skip generating more prefixes from it.
         if status in (RUN_SUCCESS, RUN_FAILURE, RUN_TIMEOUT) and trace_tuple in state.seen_traces:
             _reset_for_next_run(state)
             state.scheduler.start_run([])
@@ -159,10 +162,6 @@ def proxy(state, cfg, path: str, method: str):
     full_path = f"/{path}"
     base_step = step_key(client, thread, method, full_path)
 
-    do_delay_s = 0
-    presented = base_step
-    step_index = 0
-
     with state.cond:
         state.step_attempts_this_run[base_step] += 1
         attempt_no = state.step_attempts_this_run[base_step]
@@ -183,7 +182,14 @@ def proxy(state, cfg, path: str, method: str):
                     f"duplicate -> returning cached {status}: {pretty_step(base_step, parse_step)}",
                     flush=True,
                 )
-                write_sim_log(parse_step, base_step, status, "Retry served from cache", state.run_index + 1, len(state.trace) + 1)
+                write_sim_log(
+                    parse_step,
+                    base_step,
+                    status,
+                    "Retry served from cache",
+                    state.run_index + 1,
+                    len(state.trace) + 1,
+                )
                 return Response(body, status=status, headers=hdrs)
 
             return artifact_response_for(base_step, state.stable_response_cache, cfg.artifact_ok_status)
@@ -192,56 +198,70 @@ def proxy(state, cfg, path: str, method: str):
         if not ok:
             msg = "SIM_FORCED_PREFIX_TIMEOUT"
             state.response_cache_this_run[base_step] = (503, msg.encode("utf-8"), {"Content-Type": "text/plain"})
-            state.stable_response_cache.setdefault(base_step, (503, msg.encode("utf-8"), {"Content-Type": "text/plain"}))
+            state.stable_response_cache.setdefault(
+                base_step,
+                (503, msg.encode("utf-8"), {"Content-Type": "text/plain"}),
+            )
             state.cond.notify_all()
             return Response(msg, status=503)
 
         matched, was_drop, was_delay, matched_delay_s = state.scheduler.consume_last_match()
         presented = matched if matched is not None else base_step
 
+        # From here onward, this step owns the execution slot until it finishes.
         state.seen_base_steps_this_run.add(base_step)
         state.inflight_steps_this_run.add(base_step)
-
-        state.trace.append(presented)
-        step_index = len(state.trace)
 
         if state.scheduler.expected_now() is None:
             print(f"[SCHED] run={state.run_index+1} free={pretty_step(presented, parse_step)}", flush=True)
         else:
             print(f"[SCHED] run={state.run_index+1} got={pretty_step(presented, parse_step)}", flush=True)
 
-        # DROP: unchanged
+        # DROP: record it as an executed trace step immediately
         if was_drop:
+            state.trace.append(presented)
+            step_index = len(state.trace)
+
             print(f"[DROP] run={state.run_index+1} {pretty_step(presented, parse_step)}", flush=True)
-            write_sim_log(parse_step, base_step, cfg.artifact_ok_status, "Dropped treated as OK", state.run_index + 1, step_index)
+            write_sim_log(
+                parse_step,
+                base_step,
+                cfg.artifact_ok_status,
+                "Dropped treated as OK",
+                state.run_index + 1,
+                step_index,
+            )
+
             state.scheduler.maybe_stop_enforcing()
             state.inflight_steps_this_run.discard(base_step)
             state.cond.notify_all()
             return artifact_response_for(base_step, state.stable_response_cache, cfg.artifact_ok_status)
 
-        # ---- STRICT DELAY (the important part) ----
         do_delay_s = matched_delay_s if (was_delay and matched_delay_s > 0) else 0
         if do_delay_s > 0:
-            # Mark delay active so *all other steps block* until this one completes.
             state.delay_active = True
             print(
-                f"[DELAY] run={state.run_index+1} step={step_index} STRICT pause {do_delay_s}s -> "
+                f"[DELAY] run={state.run_index+1} STRICT pause {do_delay_s}s -> "
                 f"{pretty_step(presented, parse_step)}",
                 flush=True,
             )
 
-    # Phase 2: sleep outside lock (others are blocked by delay_active=True)
-    if do_delay_s > 0:
-        time.sleep(do_delay_s)
-        print(f"[DELAY] run={state.run_index+1} step={step_index} delay finished -> forwarding now", flush=True)
+        # IMPORTANT:
+        # Keep the simulator lock while executing the actual HTTP request.
+        # This makes scheduled order == actual execution/effect order.
+        try:
+            if do_delay_s > 0:
+                time.sleep(do_delay_s)
+                print(
+                    f"[DELAY] run={state.run_index+1} delay finished -> forwarding now",
+                    flush=True,
+                )
 
-    try:
-        resp = forward_to_localstack("http://localhost:9999", method, path, timeout=10)
-        status = resp.status_code
-        hdrs = {k: v for k, v in resp.headers.items()}
-        body = resp.content
+            resp = forward_to_localstack("http://localhost:9999", method, path, timeout=10)
+            status = resp.status_code
+            hdrs = {k: v for k, v in resp.headers.items()}
+            body = resp.content
 
-        with state.cond:
             if state.current_result["value"] == RUN_SUCCESS:
                 classified = classify_http_failure(
                     status=status,
@@ -255,32 +275,39 @@ def proxy(state, cfg, path: str, method: str):
                     state.current_result["value"] = RUN_TIMEOUT if kind == "TIMEOUT" else RUN_FAILURE
                     state.failure_reason["value"] = reason
 
+            # Record trace ONLY after the real effect/response happened
+            state.trace.append(presented)
+            step_index = len(state.trace)
+
             write_sim_log(parse_step, base_step, status, f"HTTP {status}", state.run_index + 1, step_index)
 
             label = pretty_step(base_step, parse_step)
             outcome = "OK" if status < 400 else f"HTTP {status}"
-            print(f"[STEP] run={state.run_index+1} step={step_index} {label} -> {outcome} (LocalStack={status})", flush=True)
+            print(
+                f"[STEP] run={state.run_index+1} step={step_index} {label} -> {outcome} (LocalStack={status})",
+                flush=True,
+            )
 
             state.response_cache_this_run[base_step] = (status, body, hdrs)
             state.stable_response_cache.setdefault(base_step, (status, body, hdrs))
 
             state.scheduler.maybe_stop_enforcing()
-
             state.inflight_steps_this_run.discard(base_step)
 
-            # Release STRICT delay gate
             if do_delay_s > 0:
                 state.delay_active = False
 
             state.cond.notify_all()
+            return Response(body, status, resp.headers)
 
-        return Response(body, status, resp.headers)
-
-    except Exception as e:
-        with state.cond:
+        except Exception as e:
             if state.current_result["value"] == RUN_SUCCESS and cfg.treat_408_as_timeout:
                 state.current_result["value"] = RUN_TIMEOUT
                 state.failure_reason["value"] = f"LocalStack/forwarding exception: {type(e).__name__}"
+
+            # Record the attempted step after the forwarding failure/timeout
+            state.trace.append(presented)
+            step_index = len(state.trace)
 
             print(
                 f"[STEP] run={state.run_index+1} step={step_index} "
@@ -288,14 +315,19 @@ def proxy(state, cfg, path: str, method: str):
                 flush=True,
             )
 
-            write_sim_log(parse_step, base_step, 408, "Timeout (forwarding exception)", state.run_index + 1, step_index)
+            write_sim_log(
+                parse_step,
+                base_step,
+                408,
+                "Timeout (forwarding exception)",
+                state.run_index + 1,
+                step_index,
+            )
 
             state.inflight_steps_this_run.discard(base_step)
 
-            # Release STRICT delay gate even on exception
             if do_delay_s > 0:
                 state.delay_active = False
 
             state.cond.notify_all()
-
-        return Response("Timeout", status=408)
+            return Response("Timeout", status=408)

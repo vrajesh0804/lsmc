@@ -113,23 +113,3 @@ def reset_localstack_quiet() -> None:
         print("[SIM] LocalStack reset complete", flush=True)
     except Exception as e:
         print(f"[SIM] LocalStack reset failed: {e}", flush=True)
-
-
-def print_final_summary(
-    results: List[Tuple[str, str]],
-    *,
-    run_success: str,
-    run_failure: str,
-    run_crash: str,
-    run_timeout: str,
-    run_infeasible: str,
-) -> None:
-    def count(kind: str) -> int:
-        return sum(1 for r, _ in results if r == kind)
-
-    print("\n📊 FINAL SUMMARY")
-    print(f"  ✅ Success     : {count(run_success)}")
-    print(f"  ❌ Failure     : {count(run_failure)}")
-    print(f"  💥 Crash       : {count(run_crash)}")
-    print(f"  ⏱ Timeout     : {count(run_timeout)}")
-    print(f"  🚫 Infeasible  : {count(run_infeasible)}")

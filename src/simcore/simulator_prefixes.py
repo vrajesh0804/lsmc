@@ -1,4 +1,3 @@
-# src/simcore/simulator_prefixes.py
 from typing import List, Tuple
 from src.simcore.dpor import parse_step
 from src.simcore.sim_helpers import print_prefix

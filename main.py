@@ -1,4 +1,3 @@
-# main.py
 import os
 import sys
 import time
@@ -6,6 +5,8 @@ import threading
 import subprocess
 from pathlib import Path
 from typing import Tuple, List, Optional
+# Used for different extension file
+import shlex
 
 import requests
 
@@ -14,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def run_simulator():
+    # Run the simulator
     try:
         from src.simulator import app
         print("[SIM] Simulator started on http://localhost:9998", flush=True)
@@ -95,45 +97,105 @@ def _classify_client_error_from_lines(
         detail = "Client reported error (no detail line found)"
     return (True, kind, detail)
 
+def expand_client_commands(args: list[str]) -> list[str]:
+    """
+    Allow multiple client commands inside a single argument.
 
-def run_client_streaming(client_script: str) -> Tuple[int, bool, Optional[str], str]:
+    Supported:
+      "python a.py || python b.py"
+      "python a.py; python b.py"
+      "python a.py\npython b.py"
+
+    Old behavior still works unchanged.
     """
-    Run client as: python <client_script>
-    Stream stdout/stderr to console (no pipe backpressure),
-    but also capture lines to classify client-level failures.
+    result = []
+
+    for arg in args:
+        if "\n" in arg:
+            parts = [p.strip() for p in arg.splitlines() if p.strip()]
+            result.extend(parts)
+
+        elif "||" in arg:
+            parts = [p.strip() for p in arg.split("||") if p.strip()]
+            result.extend(parts)
+
+        elif ";" in arg:
+            parts = [p.strip() for p in arg.split(";") if p.strip()]
+            result.extend(parts)
+
+        else:
+            result.append(arg.strip())
+
+    return result
+
+
+def run_client_streaming(client_scripts: list[str]) -> Tuple[int, bool, Optional[str], str]:
     """
-    client_abs = (PROJECT_ROOT / client_script).resolve()
-    cmd = [sys.executable, str(client_abs)]
+    Run multiple client commands concurrently.
+    Returns a combined result:
+      - exit_code: non-zero if any client exits non-zero
+      - client_had_error / kind / detail: merged from all client outputs
+    """
+    processes = []
+    all_lines: List[str] = []
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
-    p = subprocess.Popen(
-        cmd,
-        cwd=str(PROJECT_ROOT),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-    )
+    for client_script in client_scripts:
+        cmd = shlex.split(client_script, posix=False)
 
-    lines: List[str] = []
-    assert p.stdout is not None
-    for line in p.stdout:
-        print(line, end="")  # keep terminal output exactly like before
-        lines.append(line.rstrip("\n"))
+        # Windows fix:
+        # If command is just a .py path, run it through the current Python interpreter.
+        if len(cmd) == 1 and cmd[0].lower().endswith(".py"):
+            cmd = [sys.executable, cmd[0]]
 
-    rc = p.wait()
+        p = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        processes.append((client_script, p))
+
+    lock = threading.Lock()
+
+    def reader_thread(name: str, proc: subprocess.Popen):
+        local_lines: List[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="")
+            local_lines.append(line.rstrip("\n"))
+        with lock:
+            all_lines.extend(local_lines)
+
+    readers = []
+    for client_script, p in processes:
+        t = threading.Thread(target=reader_thread, args=(client_script, p), daemon=True)
+        t.start()
+        readers.append(t)
+
+    exit_codes = []
+    for _, p in processes:
+        exit_codes.append(p.wait())
+
+    for t in readers:
+        t.join()
+
+    combined_exit_code = 0 if all(rc == 0 for rc in exit_codes) else 1
+
     client_had_error, client_error_kind, client_error_detail = _classify_client_error_from_lines(
-        lines,
+        all_lines,
         treat_408_as_timeout=(env.get("SIM_408_AS_TIMEOUT", "0") == "1"),
     )
-    return rc, client_had_error, client_error_kind, client_error_detail
 
+    return combined_exit_code, client_had_error, client_error_kind, client_error_detail
 
 def notify_done(
     exit_code: int,
@@ -240,15 +302,16 @@ def main() -> int:
     if enable_delay and delay_for_val is not None:
         delay_seconds = delay_for_val
 
-    if len(args) != 1:
+    if len(args) < 1:
         print(
             "Usage: python main.py [--404-as-fail] [--408-as-timeout] [--drop] [--delay] "
-            "[--delay-for-<N>] [--delay-seconds N] [--forced-prefix-timeout N] <client_script_path>",
+            "[--delay-for-<N>] [--delay-seconds N] [--forced-prefix-timeout N] "
+            "<client_cmd_1> [<client_cmd_2> ...]",
             flush=True,
         )
         return 2
 
-    client_script = args[0]
+    client_script = expand_client_commands(args)
 
     # Auto forced-prefix timeout:
     # If delay is enabled, ensure timeout > delay so we don't falsely TIMEOUT during enforced DELAY.

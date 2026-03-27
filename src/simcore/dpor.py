@@ -1,28 +1,26 @@
-# src/simcore/dpor.py
 from __future__ import annotations
 
 from typing import List, Dict, Set, Tuple
 
+# mutation markers
 DROP_PREFIX = "DROP::"
-
-# Delay is encoded as: DELAY::<seconds>::client:thread:method:path
 DELAY_PREFIX = "DELAY::"
 
 
 def is_drop(ev: str) -> bool:
+    # helper functions for DROP/DELAY
     return ev.startswith(DROP_PREFIX)
 
-
 def undrop(ev: str) -> str:
+    # Removes the DROP:: prefix if present.
     return ev[len(DROP_PREFIX) :] if is_drop(ev) else ev
 
-
 def drop(ev: str) -> str:
+    # Adds DROP:: only if it is not already dropped.
     return ev if is_drop(ev) else (DROP_PREFIX + ev)
 
-
 def is_delay(ev: str) -> bool:
-    # Supports both "DELAY::..." and "DROP::DELAY::..." (nested)
+    # Checks whether a step is delayed.
     if ev.startswith(DELAY_PREFIX):
         return True
     if ev.startswith(DROP_PREFIX):
@@ -30,12 +28,8 @@ def is_delay(ev: str) -> bool:
         return inner.startswith(DELAY_PREFIX)
     return False
 
-
 def delay_seconds(ev: str) -> int | None:
-    """
-    If ev is DELAY::<seconds>::..., returns seconds, else None.
-    Supports nested DROP::DELAY::<seconds>::...
-    """
+    # Extracts the numeric delay from a delayed event.
     raw = ev
     if raw.startswith(DROP_PREFIX):
         raw = undrop(raw)
@@ -55,10 +49,7 @@ def delay_seconds(ev: str) -> int | None:
 
 
 def undelay(ev: str) -> str:
-    """
-    DELAY::<seconds>::client:thread:method:path  ->  client:thread:method:path
-    Supports nested DROP::DELAY::<seconds>::...
-    """
+    # Removes the delay wrapper and returns the original event.
     raw = ev
     outer_drop = False
     if raw.startswith(DROP_PREFIX):
@@ -78,27 +69,26 @@ def undelay(ev: str) -> str:
 
 
 def delay(ev: str, seconds: int) -> str:
-    """
-    Wrap event as delayed. If already delayed (possibly nested), keep as-is.
-    """
+    # Wraps a step with delay metadata.
     return ev if is_delay(ev) else f"{DELAY_PREFIX}{int(seconds)}::{ev}"
 
-
+# parsing one step
 def parse_step(step: str) -> Dict[str, object]:
     """
-    step format:
-      normal:            client:thread:method:path
-      dropped:           DROP::client:thread:method:path
-      delayed:           DELAY::<sec>::client:thread:method:path
-      dropped+delayed:   DROP::DELAY::<sec>::client:thread:method:path   (supported)
-
-    NOTE:
-      - We support nesting in either order logically, but your generator below
-        intentionally avoids creating DROP+DELAY on the same event.
+        Converts one step string into structured information.
+        For example: "A:T1:PUT:/bucket"
+        becomes something like:
+        {
+            "client": "A",
+            "thread": "T1",
+            "method": "PUT",
+            "path": "/bucket",
+            "is_drop": False,
+            "is_delay": False,
+            "delay_seconds": None,
+        }
     """
     raw = step
-
-    # support nesting in either order
     is_d = raw.startswith(DROP_PREFIX)
     if is_d:
         raw = undrop(raw)
@@ -119,42 +109,30 @@ def parse_step(step: str) -> Dict[str, object]:
         "delay_seconds": sec,
     }
 
-
+# swap helper
 def minimal_prefix_for_swap(trace: List[str], i: int, j: int) -> List[str]:
+    # Creates the shortest prefix needed to represent a swap of two steps at positions i and j.
+    # This supports schedule exploration by creating swapped versions of neighboring events.
     """
-    DPOR-style minimal prefix that makes trace[j] occur before trace[i], while
-    including the minimal same-thread prerequisites needed for feasibility.
-
-    This helper ONLY preserves per-thread program order. It does NOT model
-    data/control dependencies across threads.
+        Example
+        [
+          "A:T1:x",
+          "B:T2:y",
+          "A:T1:z"
+        ]
+        and swap i=0, j=1, then:
+        take prefix up to j
+            ["A:T1:x", "B:T2:y"]
+        swap them
+            ["B:T2:y", "A:T1:x"]
     """
     assert 0 <= i < j < len(trace)
 
-    ti = parse_step(trace[i])["thread"]
-    tj = parse_step(trace[j])["thread"]
-
-    prereq_idx = set()
-
-    # prerequisites in ti that must occur before i
-    for k in range(0, i):
-        if parse_step(trace[k])["thread"] == ti:
-            prereq_idx.add(k)
-
-    # prerequisites in tj that must occur before j
-    for k in range(0, j):
-        if parse_step(trace[k])["thread"] == tj:
-            prereq_idx.add(k)
-
-    # we will explicitly place j then i at the end
-    prereq_idx.discard(i)
-    prereq_idx.discard(j)
-
-    prefix = [trace[k] for k in sorted(prereq_idx)]
-    prefix.append(trace[j])
-    prefix.append(trace[i])
+    prefix = list(trace[: j + 1])
+    prefix[i], prefix[j] = prefix[j], prefix[i]
     return prefix
 
-
+# main function
 def generate_forced_prefixes(
     trace: List[str],
     seen_prefixes: Set[Tuple[str, ...]],
@@ -164,30 +142,32 @@ def generate_forced_prefixes(
     enable_delay: bool = False,
     delay_s: int = 20,
 ) -> List[List[str]]:
+    # 
     """
-    Generate forced prefixes.
+        trace: A full observed execution trace.
+        seen_prefixes: Prefixes already generated in memory before. Prevents duplicates.
+        explored_prefixes: Prefixes already actually explored/executed before. Prevents retrying old work.
+        enable_drop: Whether to generate dropped-event mutations.
+        enable_delay: Whether to generate delayed-event mutations.
+        delay_s: How many seconds to use when creating delayed steps.
 
-    Strategy:
-      (A) SWAPS: adjacent cross-thread swaps only (conservative DPOR heuristic)
-      (B) DROP mutations: prefix up to i+1, with event i replaced by DROP::event (if enabled)
-      (C) DELAY mutations: prefix up to i+1, with event i replaced by DELAY::<s>::event (if enabled)
-      (D) MIXED DROP+DELAY: choose i != j, build prefix up to max(i,j)+1,
-          apply DROP to one event and DELAY to the other (if both enabled)
 
-    IMPORTANT CONSTRAINT (your requirement):
-      - The same event cannot be both DROP and DELAY in the same execution.
-        Therefore, we DO NOT generate DROP::DELAY::X (or DELAY wrapped in DROP) for the same step.
+        Avoids duplicates by checking:
+            seen_prefixes: already generated before
+            explored_prefixes: already executed before
+
     """
-    new_prefixes: List[List[str]] = []
-    parsed = [parse_step(s) for s in trace]
-    n = len(trace)
+    new_prefixes: List[List[str]] = [] # collects results
+    parsed = [parse_step(s) for s in trace] # gives structured info for each step
+    n = len(trace) # trace length
 
     # (A) Adjacent cross-thread swaps only
     for i in range(n - 1):
         j = i + 1
         if parsed[i]["thread"] == parsed[j]["thread"]:
             continue
-
+        # create swapped prefix; skip if already known; otherwise store it
+        # Explore alternative thread interleavings.
         swapped_prefix = minimal_prefix_for_swap(trace, i, j)
         tp = tuple(swapped_prefix)
         if tp in seen_prefixes or tp in explored_prefixes:
@@ -197,10 +177,15 @@ def generate_forced_prefixes(
 
     # Helpers: for *single-mutation* generation, don't mutate a step that is already mutated
     def _is_mutated(step: str) -> bool:
+        # Checks whether a step already has some mutation.
         return is_drop(step) or is_delay(step)
 
     # (B) DROP mutation prefixes (single-mutation)
     if enable_drop:
+        """
+            take prefix up to that step
+            mark that step as dropped
+        """
         for i in range(n):
             if _is_mutated(trace[i]):
                 continue
@@ -215,6 +200,10 @@ def generate_forced_prefixes(
 
     # (C) DELAY mutation prefixes (single-mutation)
     if enable_delay:
+        """
+            take prefix up to that step
+            mark that step as delayed
+        """
         for i in range(n):
             if _is_mutated(trace[i]):
                 continue
@@ -229,6 +218,10 @@ def generate_forced_prefixes(
 
     # (D) MIXED DROP+DELAY on two DIFFERENT events
     if enable_drop and enable_delay:
+        """
+            one event is dropped
+            another different event is delayed
+        """
         # i = index to DROP, j = index to DELAY (i != j)
         for i in range(n):
             if _is_mutated(trace[i]):
